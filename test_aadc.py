@@ -148,13 +148,13 @@ def test_3comp_casadi_crashes():
     if not HAS_CASADI:
         Results.skipped += 1; print("  SKIP  (no casadi)"); return
 
-    sys.path.insert(0, '/tmp/circulatory_autogen/tests/test_outputs/'
-                    'tests_test_param_id.py_test_param_id_3compartment_python_succeeds/'
-                    'generated_models/3compartment_3compartment_obs_data')
     try:
         import importlib
         mod = importlib.import_module('3compartment')
         u = importlib.import_module('3compartment_utilities')
+    except ImportError:
+        Results.skipped += 1; print("  SKIP  (circulatory_autogen model not found)"); return
+    try:
 
         states = mod.create_states_array()
         variables = mod.create_variables_array()

@@ -139,13 +139,15 @@ def test_3comp_casadi():
 
     print("  Attempting to trace model with CasADI symbolic variables...")
     try:
-        # Import Auckland's generated model
-        sys.path.insert(0, '/tmp/circulatory_autogen/tests/test_outputs/'
-                        'tests_test_param_id.py_test_param_id_3compartment_python_succeeds/'
-                        'generated_models/3compartment_3compartment_obs_data')
+        # Try to import Auckland's generated model (optional — needs circulatory_autogen installed)
         import importlib
-        mod = importlib.import_module('3compartment')
-        u = importlib.import_module('3compartment_utilities')
+        try:
+            mod = importlib.import_module('3compartment')
+            u = importlib.import_module('3compartment_utilities')
+        except ImportError:
+            print("  SKIP (circulatory_autogen generated model not found)")
+            print("  To run this test: pip install -e <circulatory_autogen> and run their tests first")
+            return
 
         states = mod.create_states_array()
         variables = mod.create_variables_array()
