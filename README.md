@@ -1,7 +1,17 @@
 # AADC for CellML ODE Model Calibration
 
-AADC as a drop-in replacement for CasADI for differentiating physiological ODE models.
-CasADI crashes on models with conditional logic (valve open/close). AADC handles it.
+Benchmark and examples for using [AADC](https://matlogica.com) (Automatic Adjoint Differentiation Compiler)
+as an AD backend for physiological ODE models from the
+[circulatory_autogen](https://github.com/physiomelinks/circulatory_autogen) project
+(University of Auckland).
+
+**The problem:** CasADI (their current AD backend) uses symbolic expression graphs.
+When the model contains `if/else` (e.g. heart valve opening/closing logic),
+CasADI calls `SX.__bool__()` on a symbolic variable and crashes.
+
+**The solution:** AADC records the actual execution and handles conditionals
+via `aadc.iif()`, which evaluates both branches and selects at replay time.
+Gradients are exact, Hessian and HMC sampling work out of the box.
 
 ## Prerequisites
 
@@ -131,12 +141,15 @@ Posterior statistics:
 
 ## Build and run C++ benchmarks (optional)
 
-Set `AADC` path in `Makefile`, then:
+The C++ version of the same 3-compartment model runs ~2x faster than Python
+(3.3ms vs 6.5ms per gradient) and supports multi-thread + AVX vectorization
+for throughput up to 5,000 gradient evaluations per second.
+
+Set `AADC` path in `Makefile` to your AADC C++ installation, then:
 
 ```bash
-cd exp/CellML
-make
-make bench          # runs all: AADC C++ + CasADI Python baseline
+make                # build lotka_bench and cvs3_aadc
+make bench          # run all C++ benchmarks
 ./cvs3_aadc --threads 8 --iters 50   # 3-compartment only
 ```
 
@@ -159,25 +172,44 @@ Hessian (4x4) computed in 26.55 ms
 
 ## Files
 
+**Python (main examples):**
+
 | File | What it does |
 |---|---|
-| `compare_casadi_vs_aadc.py` | **Start here:** side-by-side CasADI vs AADC comparison |
-| `cvs3_aadc_python.py` | Python: 3-compartment model + gradient benchmark |
-| `example_usage.py` | Python: gradient, Hessian, batch evaluation |
-| `example_hmc.py` | Python: HMC posterior sampling |
-| `cvs3_aadc.cpp` | C++: same model, multi-thread, Hessian |
-| `lotka_bench.cpp` | C++: Lotka-Volterra benchmark (1,323× vs CasADI) |
-| `run_casadi_bench.py` | CasADI baseline (crashes on 3-compartment) |
-| `Makefile` | `make` / `make bench` |
+| `compare_casadi_vs_aadc.py` | **Start here.** Runs both CasADI and AADC on both models side by side. Shows CasADI crash vs AADC success. |
+| `cvs3_aadc_python.py` | Full 3-compartment cardiovascular model (27 states, 4 calibration params) ported to AADC. All valve conditionals use `aadc.iif()`. Semi-implicit Euler for stiff ODE. |
+| `example_usage.py` | Practical 4-step workflow: record kernel → gradient → Hessian → batch. Copy this as a starting template for your own model. |
+| `example_hmc.py` | Hamiltonian Monte Carlo: Bayesian posterior sampling for 2 parameters with leapfrog integrator and Metropolis accept/reject. |
+
+**C++ (optional, for maximum performance):**
+
+| File | What it does |
+|---|---|
+| `cvs3_aadc.cpp` | Same 3-compartment model in C++ with AADC. Multi-thread, AVX, Hessian. 0.2 ms/eval at 8 threads. |
+| `lotka_bench.cpp` | Lotka-Volterra (2 states) C++ benchmark. 1,323× faster than CasADI AD. |
+
+**Baselines:**
+
+| File | What it does |
+|---|---|
+| `run_casadi_bench.py` | CasADI baseline for Lotka-Volterra. Crashes on 3-compartment. |
+| `Makefile` | `make` builds C++. `make bench` runs all C++ benchmarks. |
 
 ---
 
 ## Appendix: Integrating AADC with your own CellML model
 
+To use AADC with a different CellML model (not just the 3-compartment example),
+you need three things: (1) replace conditionals in the generated Python,
+(2) provide an ODE stepper that works with `aadc.idouble`,
+(3) wrap it in `aadc.Functions()` for recording and replay.
+
 ### Step 1: Modify generated Python code
 
-The CellML code generator produces `compute_rates()` with `if/else` and `max()`.
-Three replacements needed:
+The [circulatory_autogen](https://github.com/physiomelinks/circulatory_autogen)
+code generator (libCellML) produces a Python file with `compute_rates()`.
+It uses `leq_func`/`geq_func` + Python ternary for conditionals
+and `max()` for clamping. These need mechanical replacement:
 
 | Pattern | Replace with | Example |
 |---|---|---|
@@ -187,7 +219,12 @@ Three replacements needed:
 
 ### Step 2: Write ODE stepper
 
-For stiff models, use semi-implicit Euler with diagonal damping:
+Standard ODE solvers (scipy, CVODES) cannot be recorded on the AADC tape
+because they contain internal logic that doesn't go through `idouble`.
+Instead, write a simple stepper in Python using `idouble` arithmetic.
+For stiff models (like cardiovascular), use semi-implicit Euler with
+diagonal damping — this keeps the stiff states stable without
+requiring an implicit Newton solve:
 
 ```python
 for step in range(total_steps):
@@ -200,6 +237,10 @@ for step in range(total_steps):
 See `cvs3_aadc_python.py` for complete implementation.
 
 ### Step 3: Record kernel + evaluate
+
+The AADC workflow: record all operations once (slow, ~3s), then
+replay forward + reverse many times (fast, ~6ms each).
+The recorded kernel is reusable — change parameter values without re-recording.
 
 ```python
 import aadc
