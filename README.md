@@ -197,67 +197,84 @@ Hessian (4x4) computed in 26.55 ms
 
 ---
 
-## Appendix: Integrating AADC with your own CellML model
+## Integration with circulatory_autogen
 
-To use AADC with a different CellML model (not just the 3-compartment example),
-you need three things: (1) replace conditionals in the generated Python,
-(2) provide an ODE stepper that works with `aadc.idouble`,
-(3) wrap it in `aadc.Functions()` for recording and replay.
+`circulatory_autogen` has a clean backend architecture — all solvers go through
+a common `SimulationHelper` interface in `src/solver_wrappers/`. This means AADC
+can be plugged in as a peer to CasADI/Myokit/OpenCOR and propagate to the entire
+pipeline: paramID, HMC, sensitivity analysis, and the 12 LABOURS platform.
 
-### Step 1: Modify generated Python code
+### Architecture
 
-The [circulatory_autogen](https://github.com/physiomelinks/circulatory_autogen)
-code generator (libCellML) produces a Python file with `compute_rates()`.
-It uses `leq_func`/`geq_func` + Python ternary for conditionals
-and `max()` for clamping. These need mechanical replacement:
+```
+paramID / HMC / sensitivity_analysis
+        ↓
+  get_simulation_helper(solver="aadc_semi_implicit")
+        ↓
+  ┌──────────────────────────────────────────┐
+  │ SimulationHelper  (common interface)     │
+  │   .run()  .get_results()  .set_param_vals│
+  └────┬────────┬────────┬────────┬──────────┘
+       │        │        │        │
+   OpenCOR   Myokit    CasADI   AADC ← new
+   (CVODE)   (CVODE)  (cvodes)  (semi-implicit + iif)
+```
 
-| Pattern | Replace with | Example |
+### Installation (3 steps)
+
+**Step 1.** Copy `aadc_solver_helper.py` into circulatory_autogen:
+```bash
+cp aadc_solver_helper.py  <circulatory_autogen>/src/solver_wrappers/
+```
+
+**Step 2.** Register the backend in `src/solver_wrappers/__init__.py`:
+```python
+try:
+    from solver_wrappers.aadc_solver_helper import SimulationHelper as AadcSimulationHelper
+except Exception:
+    AadcSimulationHelper = None
+```
+
+**Step 3.** Add to `get_simulation_helper()` in the same file:
+```python
+elif solver == 'aadc_semi_implicit':
+    if AadcSimulationHelper is not None:
+        return AadcSimulationHelper(model_path, dt, sim_time, solver_info, pre_time=pre_time)
+    else:
+        raise RuntimeError("AADC solver requested but aadc is not installed")
+```
+
+### Usage
+
+In your experiment config, set:
+```yaml
+solver:
+  solver: aadc_semi_implicit
+```
+
+That's it. Any CellML model processed by circulatory_autogen now gets
+AADC gradients — including models with conditionals where CasADI crashes.
+
+### What aadc_solver_helper.py handles automatically
+
+- **Conditionals**: patches `leq_func`, `geq_func`, `max` in the generated
+  model to use `aadc.iif()` — no manual code changes needed
+- **Math functions**: patches `exp`, `sin`, `cos`, `floor` etc. to AADC versions
+- **ODE integration**: semi-implicit Euler (stiff-safe)
+- **Same interface**: `run()`, `get_results()`, `set_param_vals()`, `get_init_param_vals()`,
+  `reset_states()` — all match the existing backends
+
+## Appendix: Standalone usage (without circulatory_autogen)
+
+The Python examples in this repo work standalone — you don't need
+circulatory_autogen installed. They demonstrate the AADC workflow
+directly:
+
+| Step | How | Where to look |
 |---|---|---|
-| `x if leq_func(a, b) else y` | `aadc.iif(a <= b, x, y)` | valve logic |
-| `max(x, 0.0)` | `aadc.iif(x >= 0.0, x, 0.0)` | clamping |
-| `floor(x)` | `math.floor(float(x))` | cardiac phase |
-
-### Step 2: Write ODE stepper
-
-Standard ODE solvers (scipy, CVODES) cannot be recorded on the AADC tape
-because they contain internal logic that doesn't go through `idouble`.
-Instead, write a simple stepper in Python using `idouble` arithmetic.
-For stiff models (like cardiovascular), use semi-implicit Euler with
-diagonal damping — this keeps the stiff states stable without
-requiring an implicit Newton solve:
-
-```python
-for step in range(total_steps):
-    rates, lam = compute_rates_and_damping(st, params)
-    for i in range(N_STATES):
-        st[i] += dt * rates[i] / (1.0 + dt * lam[i])
-```
-
-`lam[i] = -∂f_i/∂y_i` — the diagonal Jacobian coefficient.
-See `cvs3_aadc_python.py` for complete implementation.
-
-### Step 3: Record kernel + evaluate
-
-The AADC workflow: record all operations once (slow, ~3s), then
-replay forward + reverse many times (fast, ~6ms each).
-The recorded kernel is reusable — change parameter values without re-recording.
-
-```python
-import aadc
-
-# Record (once, ~3s)
-funcs = aadc.Functions()
-funcs.start_recording()
-param = aadc.idouble(value)
-a_param = param.mark_as_input()
-cost = run_model(param)
-r_cost = cost.mark_as_output()
-funcs.stop_recording()
-
-# Evaluate (fast, ~6ms)
-res = aadc.evaluate(funcs, {r_cost: [a_param]}, {a_param: value}, aadc.ThreadPool(4))
-gradient = float(np.asarray(res[1][r_cost][a_param]).flat[0])
-```
-
-See `example_usage.py` for Hessian and batch evaluation.
-See `example_hmc.py` for HMC sampling.
+| Record kernel | `aadc.Functions()` + `start/stop_recording` | `example_usage.py` Step 1 |
+| Get gradient | `aadc.evaluate()` | `example_usage.py` Step 2 |
+| Hessian | FD of gradient | `example_usage.py` Step 3 |
+| HMC | Leapfrog + Metropolis | `example_hmc.py` |
+| Conditionals | `aadc.iif(cond, val_true, val_false)` | `cvs3_aadc_python.py` |
+| Stiff ODE | `y += dt*f/(1+dt*lam)` | `cvs3_aadc_python.py` |
