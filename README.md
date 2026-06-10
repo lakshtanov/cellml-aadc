@@ -97,6 +97,26 @@ Benchmark: 6.52 ms/eval (gradient included)
            153 evals/s
 ```
 
+### Expected output: `example_usage.py`
+
+```
+Step 1: Recording AADC kernel...
+  Done in 3.1s (one-time cost)
+
+Step 2: Gradient evaluation
+  Cost = 1.357312e-07
+  Gradient:
+    dC/dq_lv_init = 7.325680e-06
+    dC/dC_aortic = -6.201263e-01
+  Time: 10.0 ms/eval
+
+Step 3: Hessian via FD of gradient
+  Hessian (4x4) computed in 84 ms
+
+Step 4: Batch gradient evaluation (for HMC)
+  100 gradient evaluations in 52 ms (0.5 ms/eval)
+```
+
 ### Expected output: `example_hmc.py`
 
 ```
