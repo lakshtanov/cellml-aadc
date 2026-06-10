@@ -122,10 +122,6 @@ Hessian (4x4) computed in 26.55 ms
 | `run_casadi_bench.py` | CasADI baseline (crashes on 3-compartment) |
 | `Makefile` | `make` / `make bench` |
 
-## Document
-
-[cellml_benchmark_v6.pdf](http://dev.matlogica.com:8888/cellml_benchmark_v6.pdf)
-
 ---
 
 ## Appendix: Integrating AADC with your own CellML model
