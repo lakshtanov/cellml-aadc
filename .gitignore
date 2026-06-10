@@ -1,0 +1,6 @@
+lotka_bench
+cvs3_aadc
+*.o
+__pycache__/
+*.pyc
+*.pdf
