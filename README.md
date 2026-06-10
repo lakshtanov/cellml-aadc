@@ -23,19 +23,47 @@ python -c "import aadc; print('OK')"
 
 ## Run Python examples
 
+### 1. `compare_casadi_vs_aadc.py` — start here
+
+Runs the same two models (Lotka-Volterra and 3-compartment cardiovascular)
+with both CasADI and AADC, side by side. Shows that CasADI produces
+identical gradients on Lotka-Volterra but crashes on 3-compartment
+due to conditional valve logic. AADC handles both.
+
 ```bash
-cd exp/CellML
-
-# Side-by-side: CasADI vs AADC (start here!)
 python compare_casadi_vs_aadc.py
+```
 
-# Model + gradient benchmark
+### 2. `cvs3_aadc_python.py` — gradient benchmark
+
+Records the full 27-state cardiovascular model (2,200 time steps,
+semi-implicit Euler, all valve conditionals via `aadc.iif()`) onto
+the AADC tape and benchmarks gradient evaluation. Recording takes ~3s
+(one-time), then each gradient costs ~6ms.
+
+```bash
 python cvs3_aadc_python.py
+```
 
-# Gradient + Hessian + batch examples
+### 3. `example_usage.py` — gradient, Hessian, batch
+
+Shows the practical workflow in 4 steps: record kernel, evaluate
+single gradient, compute the full 4×4 Hessian via FD of gradient
+(84ms), and batch-evaluate 100 parameter sets at once (0.5ms/eval).
+This is what you need for calibration and uncertainty quantification.
+
+```bash
 python example_usage.py
+```
 
-# HMC sampling
+### 4. `example_hmc.py` — Hamiltonian Monte Carlo
+
+Runs full Bayesian posterior sampling for 2 calibration parameters
+(q_lv_init, C_aortic) using HMC with leapfrog integrator. Starts
+from a perturbed point, recovers true parameters within 1σ.
+200 samples in 7.7s, 96% acceptance rate.
+
+```bash
 python example_hmc.py
 ```
 
