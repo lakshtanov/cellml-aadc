@@ -111,6 +111,28 @@ All gradients verified against central finite differences:
 | CVS: Discrete adjoint vs FD | 1.000000 |
 | CVS: Hessian symmetry | < 1% |
 
+## Why Runtime AD Matters for Multi-Organ Models
+
+The 12 LABOURS project aims to build patient-specific digital twins
+combining multiple organ models (heart, lungs, kidneys, vasculature...)
+each written in CellML, each potentially with conditional logic.
+
+**Compile-time AD (CasADI approach):**
+- Must assemble the full symbolic graph of all coupled organs before computing
+- Every new patient configuration (which organs, which connections) = rebuild the graph
+- Any `if/else` in any sub-model breaks the entire symbolic graph
+- Adding or removing an organ requires re-deriving the adjoint
+
+**Runtime AD (AADC approach):**
+- Run the coupled model → tape records automatically → gradient ready
+- Change patient configuration → re-run → new tape, no recompilation
+- Conditionals in any sub-model handled transparently via `iif()`
+- Add/remove organs at runtime with no AD infrastructure changes
+
+For clinical use (calibrate model to this patient's data, now), runtime AD
+eliminates the compile step between "change the model" and "get the gradient".
+This is the difference between a research tool and a clinical tool.
+
 ## Hardware
 
 All benchmarks on Intel Xeon Silver 4114 (10 cores), single socket.
