@@ -291,6 +291,240 @@ def test_3comp_hessian_symmetric():
     assert rel_asym < 0.01, f"Hessian asymmetry: {rel_asym:.4e}"
 
 
+# ---- SimulationHelper / RK45 / discrete adjoint tests ----
+
+def _make_lv_model():
+    """Build a minimal in-memory CellML-style module for Lotka-Volterra."""
+    import types
+    mod = types.ModuleType("lv_model")
+    mod.STATE_COUNT = 2
+    mod.VARIABLE_INFO = [
+        {"type": type("T", (), {"name": "CONSTANT"})()},  # alpha
+        {"type": type("T", (), {"name": "CONSTANT"})()},  # beta
+        {"type": type("T", (), {"name": "CONSTANT"})()},  # delta
+        {"type": type("T", (), {"name": "CONSTANT"})()},  # gamma
+    ]
+    mod.STATE_INFO = [
+        {"name": "x", "units": "dimensionless"},
+        {"name": "y", "units": "dimensionless"},
+    ]
+
+    def create_states_array():
+        return [1.0, 1.0]
+
+    def initialise_variables(states, rates, variables):
+        states[0] = 1.0
+        states[1] = 1.0
+        variables[0] = 1.5  # alpha
+        variables[1] = 1.0  # beta
+        variables[2] = 3.0  # delta
+        variables[3] = 1.0  # gamma
+
+    def compute_computed_constants(variables):
+        pass
+
+    def compute_rates(t, states, rates, variables):
+        x, y = states[0], states[1]
+        alpha, beta, delta, gamma = variables[0], variables[1], variables[2], variables[3]
+        rates[0] = alpha * x - beta * x * y
+        rates[1] = delta * x * y - gamma * y
+
+    mod.create_states_array = create_states_array
+    mod.initialise_variables = initialise_variables
+    mod.compute_computed_constants = compute_computed_constants
+    mod.compute_rates = compute_rates
+    return mod
+
+
+def _make_lv_helper():
+    """Build a SimulationHelper wrapping the minimal LV model."""
+    import tempfile, os, types
+    from aadc_solver_helper import SimulationHelper
+
+    # Write a minimal model file (SimulationHelper loads via file path)
+    src = """\
+import math
+STATE_COUNT = 2
+VARIABLE_INFO = [
+    type('T', (), {'type': type('V', (), {'name': 'CONSTANT'})()})(),
+    type('T', (), {'type': type('V', (), {'name': 'CONSTANT'})()})(),
+    type('T', (), {'type': type('V', (), {'name': 'CONSTANT'})()})(),
+    type('T', (), {'type': type('V', (), {'name': 'CONSTANT'})()})(),
+]
+STATE_INFO = [
+    {'name': 'x', 'units': 'dimensionless'},
+    {'name': 'y', 'units': 'dimensionless'},
+]
+def create_states_array(): return [1.0, 1.0]
+def initialise_variables(s, r, v): s[0]=1.0; s[1]=1.0; v[0]=1.5; v[1]=1.0; v[2]=3.0; v[3]=1.0
+def compute_computed_constants(v): pass
+def compute_rates(t, s, r, v):
+    x, y = s[0], s[1]
+    r[0] = v[0]*x - v[1]*x*y
+    r[1] = v[2]*x*y - v[3]*y
+"""
+    fd, path = tempfile.mkstemp(suffix=".py")
+    os.write(fd, src.encode())
+    os.close(fd)
+    return path
+
+
+def test_rk45_vs_scipy():
+    """RK45 trajectory matches scipy solve_ivp(RK45) on Lotka-Volterra."""
+    try:
+        from scipy.integrate import solve_ivp
+    except ImportError:
+        Results.skipped += 1; print("  SKIP  (no scipy)"); return
+    if not HAS_AADC:
+        Results.skipped += 1; print("  SKIP  (no aadc)"); return
+
+    import os
+    from aadc_solver_helper import SimulationHelper
+
+    path = _make_lv_helper()
+    try:
+        dt = 0.01
+        sim_time = 5.0
+        h = SimulationHelper(path, dt=dt, sim_time=sim_time, pre_time=0.0)
+        h.run()
+        aadc_x = h.state_traj[0, :]
+        aadc_y = h.state_traj[1, :]
+
+        def lv_rhs(t, s):
+            return [1.5*s[0] - 1.0*s[0]*s[1], 3.0*s[0]*s[1] - 1.0*s[1]]
+
+        sol = solve_ivp(lv_rhs, [0.0, sim_time], [1.0, 1.0], method='RK45',
+                        t_eval=h.tSim, rtol=1e-8, atol=1e-10)
+
+        diff_x = np.max(np.abs(aadc_x - sol.y[0]))
+        diff_y = np.max(np.abs(aadc_y - sol.y[1]))
+        assert diff_x < 1e-5, f"x trajectory max diff vs scipy: {diff_x:.2e}"
+        assert diff_y < 1e-5, f"y trajectory max diff vs scipy: {diff_y:.2e}"
+    finally:
+        os.unlink(path)
+
+
+def test_compute_gradient_vs_fd():
+    """compute_gradient() matches central FD to ratio ~1 on Lotka-Volterra."""
+    if not HAS_AADC:
+        Results.skipped += 1; print("  SKIP  (no aadc)"); return
+
+    import os
+    from aadc_solver_helper import SimulationHelper
+
+    path = _make_lv_helper()
+    try:
+        dt = 0.02
+        sim_time = 2.0
+
+        def run_cost(alpha_val, beta_val):
+            h = SimulationHelper(path, dt=dt, sim_time=sim_time, pre_time=0.0)
+            # manually override constants (var index 0 = alpha, 1 = beta)
+            h.variables[0] = alpha_val
+            h.variables[1] = beta_val
+            h.run()
+            x_T = h.state_traj[:, -1]
+            return float(x_T[0]**2 + x_T[1]**2)
+
+        alpha0, beta0 = 1.5, 1.0
+        eps = 1e-5
+
+        # FD gradients
+        fd_alpha = (run_cost(alpha0 + eps, beta0) - run_cost(alpha0 - eps, beta0)) / (2 * eps)
+        fd_beta = (run_cost(alpha0, beta0 + eps) - run_cost(alpha0, beta0 - eps)) / (2 * eps)
+
+        # Discrete adjoint gradient
+        # param names: SimulationHelper uses VariableNameResolver which is None
+        # in standalone mode — skip this test if resolver unavailable
+        h = SimulationHelper(path, dt=dt, sim_time=sim_time, pre_time=0.0)
+        if h._resolver is None:
+            # Can't resolve by name without circulatory_autogen — use index-based workaround
+            # by directly calling the internal methods with known var indices
+            Results.skipped += 1
+            print("  SKIP  (no VariableNameResolver in standalone mode)")
+            return
+
+        h._ad_param_names = ["alpha", "beta"]
+        h._ad_param_var_indices = [0, 1]
+        h._do_ad = True
+        variables_all = list(h._numeric_variables_all)
+        for ci, vi in enumerate(h.constant_indices):
+            variables_all[vi] = h.variables[ci]
+        h._record_rhs_aad(variables_all)
+        h.run()
+
+        def cost_func(x_T):
+            return float(x_T[0]**2 + x_T[1]**2)
+
+        grad = h.compute_gradient(cost_func)
+        ratio_alpha = grad[0] / fd_alpha if abs(fd_alpha) > 1e-12 else 1.0
+        ratio_beta = grad[1] / fd_beta if abs(fd_beta) > 1e-12 else 1.0
+        assert abs(ratio_alpha - 1.0) < 0.01, f"d/d_alpha ratio={ratio_alpha:.6f}"
+        assert abs(ratio_beta - 1.0) < 0.01, f"d/d_beta ratio={ratio_beta:.6f}"
+    finally:
+        os.unlink(path)
+
+
+def test_reset_and_gradient_correctness():
+    """After reset_and_clear + re-run, compute_gradient still correct (catches Bug 2)."""
+    if not HAS_AADC:
+        Results.skipped += 1; print("  SKIP  (no aadc)"); return
+
+    import os
+    from aadc_solver_helper import SimulationHelper
+
+    path = _make_lv_helper()
+    try:
+        dt = 0.02
+        sim_time = 2.0
+        eps = 1e-5
+
+        def run_cost_fd(alpha_val):
+            h2 = SimulationHelper(path, dt=dt, sim_time=sim_time, pre_time=0.0)
+            h2.variables[0] = alpha_val
+            h2.run()
+            x_T = h2.state_traj[:, -1]
+            return float(x_T[0]**2 + x_T[1]**2)
+
+        fd_alpha = (run_cost_fd(1.5 + eps) - run_cost_fd(1.5 - eps)) / (2 * eps)
+
+        h = SimulationHelper(path, dt=dt, sim_time=sim_time, pre_time=0.0)
+        if h._resolver is None:
+            Results.skipped += 1
+            print("  SKIP  (no VariableNameResolver in standalone mode)")
+            return
+
+        # First run with adjoint
+        h._ad_param_names = ["alpha", "beta"]
+        h._ad_param_var_indices = [0, 1]
+        h._do_ad = True
+        variables_all = list(h._numeric_variables_all)
+        for ci, vi in enumerate(h.constant_indices):
+            variables_all[vi] = h.variables[ci]
+        h._record_rhs_aad(variables_all)
+        h.run()
+        grad1 = h.compute_gradient(lambda x: float(x[0]**2 + x[1]**2))
+
+        # Reset and redo — should NOT use stale _rk_data or _aad_funcs
+        h.reset_and_clear()
+        h._ad_param_names = ["alpha", "beta"]
+        h._ad_param_var_indices = [0, 1]
+        h._do_ad = True
+        variables_all = list(h._numeric_variables_all)
+        for ci, vi in enumerate(h.constant_indices):
+            variables_all[vi] = h.variables[ci]
+        h._record_rhs_aad(variables_all)
+        h.run()
+        grad2 = h.compute_gradient(lambda x: float(x[0]**2 + x[1]**2))
+
+        # Both runs should match each other and FD
+        assert abs(grad1[0] - grad2[0]) < 1e-10, f"grad[alpha] changed after reset: {grad1[0]} vs {grad2[0]}"
+        ratio = grad2[0] / fd_alpha if abs(fd_alpha) > 1e-12 else 1.0
+        assert abs(ratio - 1.0) < 0.01, f"post-reset d/d_alpha ratio={ratio:.6f}"
+    finally:
+        os.unlink(path)
+
+
 def main():
     print("=" * 60)
     print("AADC CellML Backend Tests")
@@ -303,6 +537,9 @@ def main():
         ("3-compartment: AADC works", test_3comp_aadc_works),
         ("3-compartment: AADC gradient vs FD", test_3comp_aadc_gradient_vs_fd),
         ("3-compartment: Hessian symmetric", test_3comp_hessian_symmetric),
+        ("RK45 vs scipy solve_ivp", test_rk45_vs_scipy),
+        ("compute_gradient vs FD", test_compute_gradient_vs_fd),
+        ("reset_and_clear gradient correctness", test_reset_and_gradient_correctness),
     ]
 
     for name, func in tests:
