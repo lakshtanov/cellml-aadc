@@ -290,6 +290,13 @@ class SimulationHelper:
                 idx = self.var_name_to_idx[name]
                 self.var_traj[vi, ti_idx] = float(vars_copy[idx])
 
+    # ---- time ----
+    def get_time(self, include_pre_time=False):
+        if include_pre_time:
+            return self.tSim
+        else:
+            return self.tSim - self.pre_time
+
     # ---- results ----
     def get_all_variable_names(self):
         return list(self.state_name_to_idx.keys()) + list(self.var_name_to_idx.keys())
