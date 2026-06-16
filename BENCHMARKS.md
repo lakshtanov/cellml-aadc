@@ -99,6 +99,34 @@ for very long integrations where tape memory is prohibitive.
 Adjoint/forward ratio 1.8× is close to the theoretical optimum (2-3×).
 The per-stage VJP uses a single AADC reverse pass (optimized: `v^T f` scalar trick).
 
+## Parallelization Scaling
+
+3-compartment CVS, 27 states, 2200 steps, 2 calibration parameters.
+Tape-based gradient with varying thread count and batch size.
+
+| Threads | Batch 1 | Batch 10 | Batch 100 | Peak evals/s |
+|---|---|---|---|---|
+| 1 | 6.9 ms | 1.8 ms/eval | 1.4 ms/eval | 732 |
+| 2 | 12.0 ms | 1.5 ms/eval | 0.80 ms/eval | 1,257 |
+| 4 | 11.5 ms | 1.0 ms/eval | 0.49 ms/eval | 2,050 |
+| **8** | 10.1 ms | **0.97 ms/eval** | **0.30 ms/eval** | **3,324** |
+
+Single evaluation has overhead (~10ms) from Python → C++ call.
+Batching amortizes this: 100 evaluations cost 30ms total at 8 threads.
+SIMD (AVX2, 4 lanes) provides additional parallelism within each thread.
+
+## Application Benchmarks
+
+Using batch evaluation (tape-based, 4 threads):
+
+| Application | Evaluations | Time | Per eval |
+|---|---|---|---|
+| Hessian (2×2) | 4 | **9 ms** | 2.3 ms |
+| HMC (1000 samples, 5 leapfrog) | 5,000 | **2.4 s** | 0.48 ms |
+| Ensemble calibration (1000 patients) | 1,000 | **396 ms** | 0.40 ms |
+
+With CasADI: all three are **impossible** (gradient crashes on conditional models).
+
 ## Validation
 
 All gradients verified against central finite differences:
