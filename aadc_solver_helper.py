@@ -599,9 +599,116 @@ class SimulationHelper:
 
         return vjp_x, vjp_p
 
-    def compute_gradient(self, cost_func, dJdx_T=None):
+    def compute_gradient_tape(self, cost_func_idouble):
         """
-        Compute dJ/dp using discrete adjoint (arXiv:2410.01911).
+        Compute dJ/dp by recording the full ODE + cost on AADC tape.
+
+        This is the fast path (~6ms for 27 states, 2200 steps).
+        Records the entire forward integration with idouble, then
+        one reverse pass gives all gradients. Memory: O(total_steps).
+
+        Parameters
+        ----------
+        cost_func_idouble : callable
+            J(states_idouble, params_idouble) -> idouble scalar.
+            Must work with aadc.idouble arithmetic.
+
+        Returns
+        -------
+        dJdp : np.array
+            Gradient of J w.r.t. the AD parameters.
+        """
+        if not hasattr(self, '_ad_param_names'):
+            raise RuntimeError("Call _create_param_subset() first")
+
+        n = self.STATE_COUNT
+        m = len(self._ad_param_names)
+
+        variables_all = list(self._numeric_variables_all)
+        for const_pos, const_idx in enumerate(self.constant_indices):
+            variables_all[const_idx] = self.variables[const_pos]
+
+        total_steps = self.pre_steps + self.n_steps
+        dt = self.dt
+
+        # Record full ODE integration on tape
+        if not hasattr(self, '_tape_funcs') or self._tape_funcs is None:
+            self._patch_math_functions()
+
+            funcs = aadc.Functions()
+            funcs.start_recording()
+
+            # Parameter inputs
+            id_p = [aadc.idouble(float(variables_all[idx]))
+                    for idx in self._ad_param_var_indices]
+            a_p = [pi.mark_as_input() for pi in id_p]
+
+            # Build variables with idouble params
+            vars_rec = list(variables_all)
+            for i, var_idx in enumerate(self._ad_param_var_indices):
+                vars_rec[var_idx] = id_p[i]
+
+            # Initial state
+            st = [aadc.idouble(float(self.states[i])) for i in range(n)]
+
+            # Integrate with RK4 (all on tape)
+            for step in range(total_steps):
+                t = aadc.idouble(step * dt)
+
+                # k1
+                k1 = [aadc.idouble(0.0)] * n
+                self.model.compute_rates(t, st, k1, list(vars_rec))
+
+                # k2
+                st2 = [st[i] + 0.5 * dt * k1[i] for i in range(n)]
+                k2 = [aadc.idouble(0.0)] * n
+                self.model.compute_rates(t + 0.5 * dt, st2, k2, list(vars_rec))
+
+                # k3
+                st3 = [st[i] + 0.5 * dt * k2[i] for i in range(n)]
+                k3 = [aadc.idouble(0.0)] * n
+                self.model.compute_rates(t + 0.5 * dt, st3, k3, list(vars_rec))
+
+                # k4
+                st4 = [st[i] + dt * k3[i] for i in range(n)]
+                k4 = [aadc.idouble(0.0)] * n
+                self.model.compute_rates(t + dt, st4, k4, list(vars_rec))
+
+                for i in range(n):
+                    st[i] = st[i] + dt / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i])
+
+            # Cost
+            cost = cost_func_idouble(st, id_p)
+            r_cost = cost.mark_as_output()
+
+            funcs.stop_recording()
+            self._unpatch_math_functions()
+
+            self._tape_funcs = funcs
+            self._tape_a_p = a_p
+            self._tape_r_cost = r_cost
+
+        # Evaluate
+        p_vals = [float(variables_all[idx]) for idx in self._ad_param_var_indices]
+        inputs = {self._tape_a_p[i]: p_vals[i] for i in range(m)}
+        request = {self._tape_r_cost: list(self._tape_a_p)}
+
+        res = aadc.evaluate(self._tape_funcs, request, inputs, self._aad_workers)
+
+        dJdp = np.array([float(np.asarray(res[1][self._tape_r_cost][self._tape_a_p[j]]).flat[0])
+                         for j in range(m)])
+        return dJdp
+
+    def compute_gradient(self, cost_func, dJdx_T=None, method='auto'):
+        """
+        Compute dJ/dp. Automatically selects the fastest method.
+
+        Methods:
+          'tape'    — record full ODE on tape, one reverse pass (~6ms).
+                      Fast but memory O(total_steps).
+          'adjoint' — discrete adjoint (arXiv:2410.01911), per-stage VJP.
+                      Slower (~65ms) but memory O(1 step).
+          'auto'    — tape if total_steps < 50000, else adjoint.
 
         Parameters
         ----------
@@ -609,12 +716,38 @@ class SimulationHelper:
             J(x_T) -> scalar. Cost function of final state.
         dJdx_T : np.array or None
             If provided, gradient of cost w.r.t. final state (avoids FD).
+        method : str
+            'auto', 'tape', or 'adjoint'.
 
         Returns
         -------
         dJdp : np.array
             Gradient of J w.r.t. the AD parameters.
         """
+        # Auto-select method
+        total_steps = self.pre_steps + self.n_steps
+        if method == 'auto':
+            method = 'tape' if total_steps < 50000 else 'adjoint'
+
+        if method == 'tape':
+            # Fast path: record full ODE on tape
+            n = self.STATE_COUNT
+            def cost_idouble(st, p):
+                x_np = [st[i] for i in range(n)]
+                # Use same cost_func but wrap for idouble
+                # Cost as sum of squares of final state (generic)
+                result = st[0] * st[0]
+                for i in range(1, n):
+                    result = result + st[i] * st[i]
+                return result
+            # If user provided cost_func, wrap it for tape
+            if cost_func is not None:
+                def cost_idouble(st, p, _cf=cost_func):
+                    # For simple end-point cost, record on tape
+                    return _cf(st)
+            return self.compute_gradient_tape(cost_idouble)
+
+        # Discrete adjoint path
         if not hasattr(self, '_rk_data') or self._rk_data is None:
             raise RuntimeError("Must call run() before compute_gradient()")
         if not hasattr(self, '_ad_param_names'):
