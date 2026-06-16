@@ -3,8 +3,29 @@
 ## CasADI vs AADC
 
 The 3-compartment cardiovascular model (27 states) contains conditional valve logic
-(`if/else` for valve opening/closing). CasADI crashes on this model.
-AADC handles it via `aadc.iif()`.
+(heart valves open/close based on pressure differences using `if/else`).
+
+**Why CasADI crashes:** CasADI builds a symbolic expression graph (SX). When
+the model evaluates `chi * 2.0 if leq_func(chi, 0.5) else 0.0`, Python calls
+`SX.__bool__()` to decide which branch to take. But `chi` is a symbolic variable
+with no concrete value — `__bool__()` is undefined, so CasADI raises
+`RuntimeError: Cannot compute the truth value of a CasADi SXElem`.
+This is a fundamental limitation: CasADI cannot trace through `if/else` at all.
+
+**Why AADC works:** AADC uses a tape-based approach. During recording, `idouble`
+variables carry concrete values, so `if/else` executes normally (the condition
+has a definite truth value). For parametric replay where the branch might change,
+`aadc.iif(condition, val_true, val_false)` records both branches on the tape
+and selects the correct one at evaluation time. The gradient through `iif` is
+the gradient of whichever branch was taken.
+
+```python
+# CasADI: CRASHES
+chi_final = chi * 2.0 if leq_func(chi, 0.5) else 0.0
+
+# AADC: WORKS
+chi_final = aadc.iif(chi <= 0.5, chi * 2.0, 0.0)
+```
 
 | Metric | CasADI | AADC |
 |---|---|---|
