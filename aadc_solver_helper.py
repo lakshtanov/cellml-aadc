@@ -62,6 +62,8 @@ class SimulationHelper:
         self._do_ad = False
         self._aad_funcs = None  # AAD kernel recorded by _record_rhs_aad
         self._rk_data = None    # adaptive-step trajectory stored by _integrate
+        self._n_threads = int(self.solver_info.get('threads', 4))
+        self._aad_workers = aadc.ThreadPool(self._n_threads)
 
     def set_protocol_info(self, protocol_info):
         self.protocol_info = protocol_info
@@ -509,7 +511,6 @@ class SimulationHelper:
         self._aad_a_p = a_p
         self._aad_a_t = a_t
         self._aad_r_f = r_f
-        self._aad_workers = aadc.ThreadPool(1)
 
     def _record_vjp_kernel(self):
         """Record a second AAD kernel: given adjoint seed v, compute v^T df/dx and v^T df/dp.
@@ -698,6 +699,85 @@ class SimulationHelper:
         dJdp = np.array([float(np.asarray(res[1][self._tape_r_cost][self._tape_a_p[j]]).flat[0])
                          for j in range(m)])
         return dJdp
+
+    def compute_gradient_batch(self, param_array, cost_func_idouble=None):
+        """
+        Batch gradient evaluation for multiple parameter sets.
+
+        Uses multi-threading + AVX vectorization for throughput.
+        Requires tape-based kernel (recorded by compute_gradient_tape).
+
+        Parameters
+        ----------
+        param_array : np.array, shape (N, m)
+            N sets of m parameters.
+        cost_func_idouble : callable or None
+            If tape not yet recorded, uses this to record.
+
+        Returns
+        -------
+        costs : np.array, shape (N,)
+        grads : np.array, shape (N, m)
+        """
+        if not hasattr(self, '_tape_funcs') or self._tape_funcs is None:
+            if cost_func_idouble is not None:
+                self.compute_gradient_tape(cost_func_idouble)
+            else:
+                raise RuntimeError("Tape kernel not recorded. Call compute_gradient_tape or pass cost_func_idouble.")
+
+        m = len(self._ad_param_names)
+        N = param_array.shape[0]
+
+        inputs = {self._tape_a_p[j]: param_array[:, j] for j in range(m)}
+        request = {self._tape_r_cost: list(self._tape_a_p)}
+
+        res = aadc.evaluate(self._tape_funcs, request, inputs, self._aad_workers)
+
+        costs = np.asarray(res[0][self._tape_r_cost]).flatten()[:N]
+        grads = np.zeros((N, m))
+        for j in range(m):
+            grads[:, j] = np.asarray(res[1][self._tape_r_cost][self._tape_a_p[j]]).flatten()[:N]
+
+        return costs, grads
+
+    def compute_hessian(self, cost_func, eps=1e-5):
+        """
+        Compute Hessian via FD of tape gradient. Uses batch evaluation.
+
+        Returns
+        -------
+        H : np.array, shape (m, m)
+        """
+        m = len(self._ad_param_names)
+        variables_all = list(self._numeric_variables_all)
+        for const_pos, const_idx in enumerate(self.constant_indices):
+            variables_all[const_idx] = self.variables[const_pos]
+        p0 = np.array([float(variables_all[idx]) for idx in self._ad_param_var_indices])
+
+        # Build 2m parameter sets (up/down for each param)
+        param_sets = []
+        for i in range(m):
+            h = p0[i] * eps if p0[i] != 0 else eps
+            p_up = p0.copy(); p_up[i] += h
+            p_dn = p0.copy(); p_dn[i] -= h
+            param_sets.append(p_up)
+            param_sets.append(p_dn)
+        param_array = np.array(param_sets)
+
+        # Batch evaluate all 2m gradient evaluations at once
+        def cost_id(st, p):
+            return cost_func(st)
+        _, grads = self.compute_gradient_batch(param_array, cost_func_idouble=cost_id)
+
+        # Compute Hessian from gradient differences
+        H = np.zeros((m, m))
+        for i in range(m):
+            h = p0[i] * eps if p0[i] != 0 else eps
+            grad_up = grads[2*i, :]
+            grad_dn = grads[2*i+1, :]
+            H[i, :] = (grad_up - grad_dn) / (2 * h)
+
+        return H
 
     def compute_gradient(self, cost_func, dJdx_T=None, method='auto'):
         """
