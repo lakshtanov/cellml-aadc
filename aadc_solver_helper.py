@@ -218,31 +218,121 @@ class SimulationHelper:
     # ---- ODE integration (semi-implicit Euler) ----
     def _integrate(self, states, variables_all, total_steps, dt):
         """
-        Semi-implicit Euler integration.
-        Works with both plain float (numeric) and aadc.idouble (recording).
+        Adaptive RK45 (Dormand-Prince) integration.
+
+        Uses the algorithm from arXiv:2410.01911 (Martins & Lakshtanov).
+        Adaptive step size for accuracy; stores stages for discrete adjoint.
 
         Returns state trajectory: list of state arrays at each sim-time step.
+        Also stores self._rk_data for adjoint computation.
         """
-        st = list(states)
         n = self.STATE_COUNT
-        rates = [0.0] * n
+        x = np.array(states[:n], dtype=float)
+        vars_all = list(variables_all)
 
-        # Storage for sim-time portion only
+        # Dormand-Prince 4(5) Butcher tableau
+        a = np.array([
+            [0, 0, 0, 0, 0, 0, 0],
+            [1/5, 0, 0, 0, 0, 0, 0],
+            [3/40, 9/40, 0, 0, 0, 0, 0],
+            [44/45, -56/15, 32/9, 0, 0, 0, 0],
+            [19372/6561, -25360/2187, 64448/6561, -212/729, 0, 0, 0],
+            [9017/3168, -355/33, 46732/5247, 49/176, -5103/18656, 0, 0],
+            [35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0],
+        ])
+        b = np.array([35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0])
+        b_hat = np.array([5179/57600, 0, 7571/16695, 393/640, -92097/339200, 187/2100, 1/40])
+        c = np.array([0, 1/5, 3/10, 4/5, 8/9, 1, 1])
+        s = 7
+
+        tol = float(self.solver_info.get('tol', 1e-8))
+        safety = 0.9
+        h_min = 1e-12
+        h_max = dt * 10
+
+        t0 = 0.0
+        tf = total_steps * dt
+        t = t0
+        h = dt
+
+        def rhs(x_in, t_in):
+            rates = [0.0] * n
+            self.model.compute_rates(t_in, list(x_in), rates, list(vars_all))
+            return np.array(rates, dtype=float)
+
+        # Full trajectory storage
+        all_t = [t]
+        all_x = [x.copy()]
+        all_h = []
+        all_k = []
+
+        steps = 0
+        while t < tf - 1e-14:
+            if t + h > tf:
+                h = tf - t
+
+            # Compute stages
+            k = [None] * s
+            for i in range(s):
+                xi = x.copy()
+                for j in range(i):
+                    xi += h * a[i, j] * k[j]
+                k[i] = rhs(xi, t + c[i] * h)
+
+            # Higher-order solution
+            x_new = x.copy()
+            for i in range(s):
+                x_new += h * b[i] * k[i]
+
+            # Error estimate
+            err = np.zeros(n)
+            for i in range(s):
+                err += h * (b[i] - b_hat[i]) * k[i]
+            err_norm = np.linalg.norm(err / (1.0 + np.abs(x_new))) / max(np.sqrt(n), 1)
+
+            if err_norm <= tol or h <= h_min:
+                t += h
+                x = x_new
+                all_t.append(t)
+                all_x.append(x.copy())
+                all_h.append(h)
+                all_k.append([ki.copy() for ki in k])
+                steps += 1
+
+            # Adjust step size
+            if err_norm > 0:
+                h_new = safety * h * (tol / err_norm) ** 0.2
+            else:
+                h_new = h * 2.0
+            h = max(h_min, min(h_max, h_new))
+
+            if steps > 10 * total_steps:
+                break
+
+        # Store for adjoint
+        self._rk_data = {
+            't': all_t, 'x': all_x, 'h': all_h, 'k': all_k,
+            'n_states': n, 'vars_all': vars_all
+        }
+
+        # Interpolate onto uniform grid for get_results compatibility
+        # Linear interpolation between adaptive-step trajectory points
         traj = []
-
-        for step in range(total_steps):
-            # Compute rates
-            self.model.compute_rates(step * dt, st, rates, variables_all)
-
-            # Semi-implicit Euler: for stiff states, we'd compute lam[i].
-            # For now, forward Euler (works for non-stiff or with small dt).
-            # TODO: add diagonal damping for stiff models (see cvs3_aadc_python.py)
-            for i in range(n):
-                st[i] = st[i] + dt * rates[i]
-
-            # Store sim-time steps
-            if step >= self.pre_steps:
-                traj.append([s for s in st])
+        j = 0
+        for ti in self.tSim:
+            # Advance j to bracket ti
+            while j < len(all_t) - 2 and all_t[j + 1] < ti:
+                j += 1
+            if j >= len(all_t) - 1:
+                traj.append(list(all_x[-1]))
+            elif abs(all_t[j + 1] - all_t[j]) < 1e-15:
+                traj.append(list(all_x[j]))
+            else:
+                # Linear interpolation
+                alpha = (ti - all_t[j]) / (all_t[j + 1] - all_t[j])
+                xi = [(1 - alpha) * all_x[j][i] + alpha * all_x[j + 1][i]
+                      for i in range(n)]
+                traj.append(xi)
 
         return traj
 
