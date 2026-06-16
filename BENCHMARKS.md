@@ -36,7 +36,13 @@ chi_final = aadc.iif(chi <= 0.5, chi * 2.0, 0.0)
 | CVS HMC 1000 samples | IMPOSSIBLE | ~2.5 s |
 
 On Lotka-Volterra (no conditionals), CasADI and AADC perform identically (~0.2 ms).
-The difference is that AADC works on **all** models, including those with conditionals.
+
+**Note:** CasADI does not crash because of model size (27 states vs 2).
+It crashes because of `if/else` in the code. A 1000-state model without
+conditionals would work fine in CasADI. A 2-state model with one `if`
+would crash. Most realistic physiological models (valve logic, activation
+thresholds, clamping) contain conditionals — so in practice CasADI fails
+on most CellML cardiovascular models.
 
 ## AADC Tape-Based Gradient Scaling
 
