@@ -60,9 +60,8 @@ class SimulationHelper:
         self._init_state()
         self._has_run = False
         self._do_ad = False
-        self._aadc_funcs = None  # compiled kernel (set after first run with AD)
-        self._aadc_args = {}    # parameter name → AADCArgument
-        self._aadc_outputs = {} # output name → AADCArgument
+        self._aad_funcs = None  # AAD kernel recorded by _record_rhs_aad
+        self._rk_data = None    # adaptive-step trajectory stored by _integrate
 
     def set_protocol_info(self, protocol_info):
         self.protocol_info = protocol_info
@@ -113,7 +112,11 @@ class SimulationHelper:
         self.default_state_inits = list(self.states)
 
     def _patch_math_functions(self):
-        """Replace math functions in the model module with AADC-compatible versions."""
+        """Replace math functions in the model module with AADC-compatible versions.
+
+        Saves originals so _unpatch_math_functions() can restore them.
+        Safe for multi-instance use: each instance restores before the next patches.
+        """
         aadc_math_map = {
             "log": aadc.math.log,
             "exp": aadc.math.exp,
@@ -123,12 +126,15 @@ class SimulationHelper:
             "sqrt": aadc.math.sqrt,
             "pow": aadc.math.pow,
         }
+        self._math_originals = {}
         for name, func in aadc_math_map.items():
+            self._math_originals[name] = getattr(self.model, name, None)
             setattr(self.model, name, func)
 
         # floor: extract passive value (not differentiable, but needed for cardiac phase)
         def aadc_floor(x):
             return math.floor(float(x))
+        self._math_originals["floor"] = getattr(self.model, "floor", None)
         setattr(self.model, "floor", aadc_floor)
 
         # Replace comparison functions with aadc.iif versions
@@ -145,12 +151,21 @@ class SimulationHelper:
         def aadc_max(a, b):
             return aadc.iif(a >= b, a, b)
 
-        setattr(self.model, "leq_func", leq_func)
-        setattr(self.model, "geq_func", geq_func)
-        setattr(self.model, "lt_func", lt_func)
-        setattr(self.model, "gt_func", gt_func)
-        setattr(self.model, "and_func", and_func)
-        setattr(self.model, "max", aadc_max)
+        for name, func in [("leq_func", leq_func), ("geq_func", geq_func),
+                            ("lt_func", lt_func), ("gt_func", gt_func),
+                            ("and_func", and_func), ("max", aadc_max)]:
+            self._math_originals[name] = getattr(self.model, name, None)
+            setattr(self.model, name, func)
+
+    def _unpatch_math_functions(self):
+        """Restore model module to its original math functions after AAD recording."""
+        for name, orig in getattr(self, "_math_originals", {}).items():
+            if orig is None:
+                if hasattr(self.model, name):
+                    delattr(self.model, name)
+            else:
+                setattr(self.model, name, orig)
+        self._math_originals = {}
 
     # ---- name resolution ----
     def _resolve_name(self, name):
@@ -291,6 +306,8 @@ class SimulationHelper:
             err_norm = np.linalg.norm(err / (1.0 + np.abs(x_new))) / max(np.sqrt(n), 1)
 
             if err_norm <= tol or h <= h_min:
+                if h <= h_min and err_norm > tol:
+                    print(f"WARNING: RK45 step accepted at h_min={h_min} with err_norm={err_norm:.2e} > tol={tol:.2e} at t={t:.4g}. Gradient may be inaccurate.")
                 t += h
                 x = x_new
                 all_t.append(t)
@@ -485,6 +502,7 @@ class SimulationHelper:
         r_f = [fi.mark_as_output() for fi in dxdt]
 
         funcs.stop_recording()
+        self._unpatch_math_functions()
 
         self._aad_funcs = funcs
         self._aad_a_x = a_x
@@ -575,23 +593,8 @@ class SimulationHelper:
                 x_up = x_T.copy(); x_up[i] += eps
                 wbarend[i] = (cost_func(x_up) - J0) / eps
 
-        # Butcher tableau (Dormand-Prince)
-        a = np.array([
-            [0, 0, 0, 0, 0, 0, 0],
-            [1/5, 0, 0, 0, 0, 0, 0],
-            [3/40, 9/40, 0, 0, 0, 0, 0],
-            [44/45, -56/15, 32/9, 0, 0, 0, 0],
-            [19372/6561, -25360/2187, 64448/6561, -212/729, 0, 0, 0],
-            [9017/3168, -355/33, 46732/5247, 49/176, -5103/18656, 0, 0],
-            [35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0],
-        ])
-        b = np.array([35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0])
-        c = np.array([0, 1/5, 3/10, 4/5, 8/9, 1, 1])
-        s = 7
-
-        # Discrete adjoint backward sweep
+        # Butcher tableau (Dormand-Prince) — used by backward sweep below
         # (arXiv:2410.01911, Algorithm 1; ported from C++ backpropagation.hpp)
-        # Dormand-Prince Butcher tableau
         a = np.array([
             [0, 0, 0, 0, 0, 0, 0],
             [1/5, 0, 0, 0, 0, 0, 0],
@@ -666,7 +669,8 @@ class SimulationHelper:
 
     def reset_and_clear(self, only_one_exp=-1):
         self._do_ad = False
-        self._aadc_funcs = None
+        self._aad_funcs = None  # kernel recorded by _record_rhs_aad
+        self._rk_data = None    # trajectory stored by _integrate
         self._init_state()
 
     def reset_states(self):
