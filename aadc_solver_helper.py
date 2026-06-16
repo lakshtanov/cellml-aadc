@@ -346,16 +346,12 @@ class SimulationHelper:
         for const_pos, const_idx in enumerate(self.constant_indices):
             variables_all[const_idx] = self.variables[const_pos]
 
-        if not self._do_ad:
-            # Numeric run
-            traj = self._integrate(self.states, variables_all, total_steps, self.dt)
-            self.state_traj = np.array(traj).T  # (n_states, n_sim_steps)
+        # Always run forward (numeric). AD uses stored trajectory for adjoint.
+        traj = self._integrate(self.states, variables_all, total_steps, self.dt)
+        self.state_traj = np.array(traj).T  # (n_states, n_sim_steps)
 
-            # Compute algebraic variables at each time point
-            self._compute_var_traj(traj, variables_all)
-        else:
-            # AADC recording run — handled by _record_and_evaluate
-            pass
+        # Compute algebraic variables at each time point
+        self._compute_var_traj(traj, variables_all)
 
         self._has_run = True
         return True
@@ -420,10 +416,17 @@ class SimulationHelper:
     def get_all_results(self, flatten=False):
         return self.get_results(self.get_all_variable_names(), flatten=flatten)
 
-    # ---- AADC AD helpers ----
+    # ---- AADC AD: discrete adjoint (arXiv:2410.01911) ----
     def _create_param_subset(self, param_names, param_vals=None):
         """Mark parameters for AD. Called by paramID before run()."""
         self._ad_param_names = [x[0] if isinstance(x, list) else x for x in param_names]
+        self._ad_param_var_indices = []
+        for name in self._ad_param_names:
+            kind, idx = self._resolve_name(name)
+            if kind == "var":
+                self._ad_param_var_indices.append(idx)
+            else:
+                raise ValueError(f"AD parameter {name} must be a variable, got {kind}")
         if param_vals is not None:
             param_vals = np.asarray(param_vals, dtype=float)
             for i, name in enumerate(self._ad_param_names):
@@ -431,6 +434,223 @@ class SimulationHelper:
                 if kind == "var":
                     self.variables[self._var_idx_to_const_pos(idx)] = param_vals[i]
         self._do_ad = True
+
+        # Record AAD kernel immediately (needs fresh model state)
+        variables_all = list(self._numeric_variables_all)
+        for const_pos, const_idx in enumerate(self.constant_indices):
+            variables_all[const_idx] = self.variables[const_pos]
+        self._record_rhs_aad(variables_all)
+
+    def _record_rhs_aad(self, variables_all):
+        """Record the ODE RHS with AAD for vector-Jacobian products.
+
+        Uses the same pattern as the verified standalone AadRhs:
+        record compute_rates(t, x, rates, vars) with idouble x, p, t.
+        """
+        n = self.STATE_COUNT
+        m = len(self._ad_param_names)
+
+        # Use rk-adjoint-python's AadRhs which is already verified
+        vars_list = list(variables_all)
+        param_var_indices = list(self._ad_param_var_indices)
+        model = self.model
+
+        self._patch_math_functions()
+
+        def rhs_for_aad(x, p, t):
+            v = list(vars_list)
+            for i, var_idx in enumerate(param_var_indices):
+                v[var_idx] = p[i]
+            rates = [aadc.idouble(0.0) for _ in range(n)]
+            model.compute_rates(t, x, rates, v)
+            return rates
+
+        p0 = np.array([float(variables_all[idx]) for idx in param_var_indices])
+        x0 = np.zeros(n)
+
+        funcs = aadc.Functions()
+        funcs.start_recording()
+
+        id_x = [aadc.idouble(float(x0[i])) for i in range(n)]
+        a_x = [xi.mark_as_input() for xi in id_x]
+
+        id_p = [aadc.idouble(float(p0[i])) for i in range(m)]
+        a_p = [pi.mark_as_input() for pi in id_p]
+
+        id_t = aadc.idouble(0.0)
+        a_t = id_t.mark_as_input()
+
+        dxdt = rhs_for_aad(id_x, id_p, id_t)
+
+        r_f = [fi.mark_as_output() for fi in dxdt]
+
+        funcs.stop_recording()
+
+        self._aad_funcs = funcs
+        self._aad_a_x = a_x
+        self._aad_a_p = a_p
+        self._aad_a_t = a_t
+        self._aad_r_f = r_f
+        self._aad_workers = aadc.ThreadPool(1)
+
+    def _vjp(self, x, p_vals, t, v):
+        """Vector-Jacobian product via AAD kernel."""
+        n = self.STATE_COUNT
+        m = len(self._ad_param_names)
+
+        inputs = {}
+        for i in range(n):
+            inputs[self._aad_a_x[i]] = float(x[i])
+        for i in range(m):
+            inputs[self._aad_a_p[i]] = float(p_vals[i])
+        inputs[self._aad_a_t] = float(t)
+
+        all_args = list(self._aad_a_x) + list(self._aad_a_p)
+        request = {r: all_args for r in self._aad_r_f}
+
+        res = aadc.evaluate(self._aad_funcs, request, inputs, self._aad_workers)
+
+        vjp_x = np.zeros(n)
+        vjp_p = np.zeros(m)
+        for i in range(n):
+            vi = float(v[i])
+            if vi == 0.0:
+                continue
+            for j in range(n):
+                vjp_x[j] += vi * float(np.asarray(res[1][self._aad_r_f[i]][self._aad_a_x[j]]).flat[0])
+            for j in range(m):
+                vjp_p[j] += vi * float(np.asarray(res[1][self._aad_r_f[i]][self._aad_a_p[j]]).flat[0])
+
+        return vjp_x, vjp_p
+
+    def compute_gradient(self, cost_func, dJdx_T=None):
+        """
+        Compute dJ/dp using discrete adjoint (arXiv:2410.01911).
+
+        Parameters
+        ----------
+        cost_func : callable
+            J(x_T) -> scalar. Cost function of final state.
+        dJdx_T : np.array or None
+            If provided, gradient of cost w.r.t. final state (avoids FD).
+
+        Returns
+        -------
+        dJdp : np.array
+            Gradient of J w.r.t. the AD parameters.
+        """
+        if not hasattr(self, '_rk_data') or self._rk_data is None:
+            raise RuntimeError("Must call run() before compute_gradient()")
+        if not hasattr(self, '_ad_param_names'):
+            raise RuntimeError("Must call _create_param_subset() before compute_gradient()")
+
+        rk = self._rk_data
+        all_x = rk['x']
+        all_h = rk['h']
+        all_k = rk['k']
+        all_t = rk['t']
+        n = rk['n_states']
+        N = len(all_h)
+
+        # Get current parameter values
+        p_vals = np.array([self._numeric_variables_all[idx]
+                           for idx in self._ad_param_var_indices], dtype=float)
+        # Update from self.variables
+        for i, var_idx in enumerate(self._ad_param_var_indices):
+            const_pos = self._var_idx_to_const_pos(var_idx)
+            p_vals[i] = float(self.variables[const_pos])
+
+        if not hasattr(self, '_aad_funcs') or self._aad_funcs is None:
+            raise RuntimeError("AAD kernel not recorded. Call _create_param_subset() first.")
+
+        # Terminal condition
+        if dJdx_T is not None:
+            wbarend = np.array(dJdx_T, dtype=float)
+        else:
+            x_T = np.array(all_x[-1])
+            J0 = cost_func(x_T)
+            wbarend = np.zeros(n)
+            eps = 1e-7
+            for i in range(n):
+                x_up = x_T.copy(); x_up[i] += eps
+                wbarend[i] = (cost_func(x_up) - J0) / eps
+
+        # Butcher tableau (Dormand-Prince)
+        a = np.array([
+            [0, 0, 0, 0, 0, 0, 0],
+            [1/5, 0, 0, 0, 0, 0, 0],
+            [3/40, 9/40, 0, 0, 0, 0, 0],
+            [44/45, -56/15, 32/9, 0, 0, 0, 0],
+            [19372/6561, -25360/2187, 64448/6561, -212/729, 0, 0, 0],
+            [9017/3168, -355/33, 46732/5247, 49/176, -5103/18656, 0, 0],
+            [35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0],
+        ])
+        b = np.array([35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0])
+        c = np.array([0, 1/5, 3/10, 4/5, 8/9, 1, 1])
+        s = 7
+
+        # Discrete adjoint backward sweep
+        # (arXiv:2410.01911, Algorithm 1; ported from C++ backpropagation.hpp)
+        # Dormand-Prince Butcher tableau
+        a = np.array([
+            [0, 0, 0, 0, 0, 0, 0],
+            [1/5, 0, 0, 0, 0, 0, 0],
+            [3/40, 9/40, 0, 0, 0, 0, 0],
+            [44/45, -56/15, 32/9, 0, 0, 0, 0],
+            [19372/6561, -25360/2187, 64448/6561, -212/729, 0, 0, 0],
+            [9017/3168, -355/33, 46732/5247, 49/176, -5103/18656, 0, 0],
+            [35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0],
+        ])
+        b = np.array([35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0])
+        c = np.array([0, 1/5, 3/10, 4/5, 8/9, 1, 1])
+        s = 7
+
+        alphabar = np.zeros(len(p_vals))
+
+        for step in range(N - 1, -1, -1):
+            h = all_h[step]
+            x_n = np.array(all_x[step])
+            k = all_k[step]
+            t_n = all_t[step]
+
+            # Initialize stage adjoints (C++ back_prop_step lines 171-176)
+            w_bar = np.zeros((n, s + 2))
+            w_bar[:, s + 1] = wbarend
+
+            # Distribute incoming adjoint to stages (C++ lines 179-184)
+            for i in range(n):
+                w_bar[i, 0] += w_bar[i, s + 1]
+                for mm in range(1, s + 1):
+                    w_bar[i, mm] += b[mm - 1] * h * w_bar[i, s + 1]
+
+            # Backward through stages s to 1 (C++ lines 196-224)
+            for mm in range(s, 0, -1):
+                t_mn = t_n + c[mm - 1] * h
+
+                # Reconstruct intermediate state (C++ get_intermediate_state)
+                x_mn = x_n.copy()
+                for kk in range(1, mm):
+                    x_mn += h * a[mm - 1, kk - 1] * k[kk - 1]
+
+                w_bar_m = w_bar[:, mm].copy()
+                vjp_x, vjp_p = self._vjp(x_mn, p_vals, t_mn, w_bar_m)
+
+                # Update stage 0 adjoint (C++ line 211)
+                for i in range(n):
+                    w_bar[i, 0] += vjp_x[i]
+
+                # Update earlier stage adjoints (C++ lines 214-216)
+                for kk in range(1, mm):
+                    for i in range(n):
+                        w_bar[i, kk] += vjp_x[i] * a[mm - 1, kk - 1] * h
+
+                # Accumulate parameter sensitivity (C++ lines 220-222)
+                alphabar += vjp_p
+
+            # Update wbarend for next step (C++ lines 227-228)
+            wbarend[:] = w_bar[:, 0]
+
+        return alphabar
 
     # ---- reset helpers ----
     def run_offline_pre_and_set_default_state(self, offline_pre_time):
