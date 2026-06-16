@@ -511,33 +511,91 @@ class SimulationHelper:
         self._aad_r_f = r_f
         self._aad_workers = aadc.ThreadPool(1)
 
-    def _vjp(self, x, p_vals, t, v):
-        """Vector-Jacobian product via AAD kernel."""
+    def _record_vjp_kernel(self):
+        """Record a second AAD kernel: given adjoint seed v, compute v^T df/dx and v^T df/dp.
+
+        This is the efficient approach from VectorizedAdjoint (arXiv:2410.01911):
+        one forward + one reverse pass gives the full VJP, instead of n separate passes.
+        """
         n = self.STATE_COUNT
         m = len(self._ad_param_names)
 
+        funcs = aadc.Functions()
+        funcs.start_recording()
+
+        # Inputs: x, p, t (same as RHS kernel)
+        id_x = [aadc.idouble(0.0) for _ in range(n)]
+        a_x = [xi.mark_as_input() for xi in id_x]
+        id_p = [aadc.idouble(0.0) for _ in range(m)]
+        a_p = [pi.mark_as_input() for pi in id_p]
+        id_t = aadc.idouble(0.0)
+        a_t = id_t.mark_as_input()
+
+        # Adjoint seed v (also input)
+        id_v = [aadc.idouble(0.0) for _ in range(n)]
+        a_v = [vi.mark_as_input() for vi in id_v]
+
+        # Evaluate RHS
+        vars_list = list(self._numeric_variables_all)
+        for const_pos, const_idx in enumerate(self.constant_indices):
+            vars_list[const_idx] = self.variables[const_pos]
+        param_var_indices = list(self._ad_param_var_indices)
+
+        self._patch_math_functions()
+        v_copy = list(vars_list)
+        for i, var_idx in enumerate(param_var_indices):
+            v_copy[var_idx] = id_p[i]
+        rates = [aadc.idouble(0.0) for _ in range(n)]
+        self.model.compute_rates(id_t, id_x, rates, v_copy)
+        self._unpatch_math_functions()
+
+        # Compute v^T f as a scalar: sum_i v[i] * f[i]
+        vtf = id_v[0] * rates[0]
+        for i in range(1, n):
+            vtf = vtf + id_v[i] * rates[i]
+
+        # Output: v^T f (scalar). Gradients w.r.t. x and p give v^T df/dx and v^T df/dp.
+        r_vtf = vtf.mark_as_output()
+
+        funcs.stop_recording()
+
+        self._vjp_funcs = funcs
+        self._vjp_a_x = a_x
+        self._vjp_a_p = a_p
+        self._vjp_a_t = a_t
+        self._vjp_a_v = a_v
+        self._vjp_r_vtf = r_vtf
+
+    def _vjp(self, x, p_vals, t, v):
+        """Vector-Jacobian product via single AAD reverse pass.
+
+        Computes v^T df/dx (shape n) and v^T df/dp (shape m) efficiently:
+        one forward + one reverse, not n separate evaluations.
+        """
+        n = self.STATE_COUNT
+        m = len(self._ad_param_names)
+
+        if not hasattr(self, '_vjp_funcs') or self._vjp_funcs is None:
+            self._record_vjp_kernel()
+
         inputs = {}
         for i in range(n):
-            inputs[self._aad_a_x[i]] = float(x[i])
+            inputs[self._vjp_a_x[i]] = float(x[i])
         for i in range(m):
-            inputs[self._aad_a_p[i]] = float(p_vals[i])
-        inputs[self._aad_a_t] = float(t)
-
-        all_args = list(self._aad_a_x) + list(self._aad_a_p)
-        request = {r: all_args for r in self._aad_r_f}
-
-        res = aadc.evaluate(self._aad_funcs, request, inputs, self._aad_workers)
-
-        vjp_x = np.zeros(n)
-        vjp_p = np.zeros(m)
+            inputs[self._vjp_a_p[i]] = float(p_vals[i])
+        inputs[self._vjp_a_t] = float(t)
         for i in range(n):
-            vi = float(v[i])
-            if vi == 0.0:
-                continue
-            for j in range(n):
-                vjp_x[j] += vi * float(np.asarray(res[1][self._aad_r_f[i]][self._aad_a_x[j]]).flat[0])
-            for j in range(m):
-                vjp_p[j] += vi * float(np.asarray(res[1][self._aad_r_f[i]][self._aad_a_p[j]]).flat[0])
+            inputs[self._vjp_a_v[i]] = float(v[i])
+
+        all_xp = list(self._vjp_a_x) + list(self._vjp_a_p)
+        request = {self._vjp_r_vtf: all_xp}
+
+        res = aadc.evaluate(self._vjp_funcs, request, inputs, self._aad_workers)
+
+        vjp_x = np.array([float(np.asarray(res[1][self._vjp_r_vtf][self._vjp_a_x[j]]).flat[0])
+                          for j in range(n)])
+        vjp_p = np.array([float(np.asarray(res[1][self._vjp_r_vtf][self._vjp_a_p[j]]).flat[0])
+                          for j in range(m)])
 
         return vjp_x, vjp_p
 
