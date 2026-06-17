@@ -90,6 +90,8 @@ def iif(cond, val_true, val_false):
 def floor_id(x):
     """floor() for idouble — uses passive value."""
     import math
+    if hasattr(x, 'val'):
+        return math.floor(x.val())
     return math.floor(float(x))
 
 def compute_rates_and_damping(st, p, q_lv_init, C_aortic, E_lv_A, E_lv_B):
