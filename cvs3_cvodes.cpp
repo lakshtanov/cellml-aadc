@@ -324,29 +324,42 @@ void record_aadc_rhs() {
 }
 
 // CVODES dense Jacobian callback using AADC
+// Optimized: uses AVX lanes to compute multiple Jacobian rows per pass.
+// AVX2 = 4 lanes → 27 rows in 7 passes instead of 27.
 static int cvs_jac(realtype t, N_Vector y, N_Vector fy, SUNMatrix J,
                     void* user_data, N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
     const double *st = N_VGetArrayPointer(y);
+    const int lanes = (int)(sizeof(mmType)/sizeof(double));  // 4 for AVX2
 
-    // Set state inputs
-    for (int i = 0; i < N; i++) {
-        auto& v = g_ws->val(g_a_x[i]);
-        for (int k = 0; k < (int)(sizeof(mmType)/sizeof(double)); k++)
-            ((double*)&v)[k] = st[i];
-    }
+    // Set state inputs (same value in all lanes — same evaluation point)
+    for (int i = 0; i < N; i++)
+        g_ws->setVal(g_a_x[i], aadc::mmSetConst<mmType>(st[i]));
 
-    // For each output, seed = 1 and reverse to get row of Jacobian
-    for (int i = 0; i < N; i++) {
-        g_funcs->forward(*g_ws);
+    // Forward pass once (same state in all lanes)
+    g_funcs->forward(*g_ws);
+
+    // Compute Jacobian rows in batches of `lanes`
+    // Each batch: seed different output rows in different AVX lanes,
+    // one reverse pass gives `lanes` rows of the Jacobian simultaneously.
+    for (int batch = 0; batch < N; batch += lanes) {
+        int batch_size = std::min(lanes, N - batch);
+
         g_ws->resetDiff();
-        auto& d = g_ws->diff(g_r_f[i]);
-        for (int k = 0; k < (int)(sizeof(mmType)/sizeof(double)); k++)
+
+        // Seed: lane k gets output (batch + k)
+        for (int k = 0; k < batch_size; k++) {
+            auto& d = g_ws->diff(g_r_f[batch + k]);
             ((double*)&d)[k] = 1.0;
+        }
+
         g_funcs->reverse(*g_ws);
 
-        for (int j = 0; j < N; j++) {
-            double val = ((double*)&g_ws->diff(g_a_x[j]))[0];
-            SM_ELEMENT_D(J, i, j) = val;
+        // Read: lane k has gradients for row (batch + k)
+        for (int k = 0; k < batch_size; k++) {
+            for (int j = 0; j < N; j++) {
+                SM_ELEMENT_D(J, batch + k, j) =
+                    ((double*)&g_ws->diff(g_a_x[j]))[k];
+            }
         }
     }
 
