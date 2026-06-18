@@ -165,3 +165,39 @@ This is the difference between a research tool and a clinical tool.
 
 All benchmarks on Intel Xeon Silver 4114 (10 cores), single socket.
 Python 3.11, AADC trial license.
+
+## CUFLynx Integration Benchmarks
+
+Lotka-Volterra through circulatory_autogen SimulationHelper interface
+(same API as CUFLynx calls).
+
+| Method | Time | evals/s |
+|---|---|---|
+| Forward (adaptive RK45) | 35 ms | — |
+| Tape gradient (1 thr, single) | 0.10 ms | 10,000 |
+| **Tape batch (1 thr, 100 evals)** | **0.005 ms/eval** | **192,417** |
+| Tape via compute_gradient() | 0.72 ms | 1,389 |
+
+Tape batch achieves 192K gradient evaluations per second on a single thread
+for the Lotka-Volterra model. Multi-thread overhead exceeds kernel time
+for this small model (2 states, 500 steps); larger models (27+ states)
+benefit from multi-threading.
+
+## CVODES ComputeBlock Benchmarks
+
+| T (s) | Forward | Fwd + Rev | Rev/Fwd |
+|---|---|---|---|
+| 1 | 0.3 ms | 3.0 ms | 10x |
+| 5 | 1.2 ms | 7.2 ms | 6x |
+| 10 | 2.2 ms | 12.2 ms | 5.5x |
+| 20 | 4.7 ms | 26.7 ms | 5.7x |
+| 50 | 11.2 ms | 63.6 ms | 5.7x |
+
+Multi-thread ComputeBlock (T=5, parallel independent integrations):
+
+| Threads | Evals | Per eval |
+|---|---|---|
+| 1 | 2 | 15.2 ms |
+| 2 | 4 | 7.6 ms |
+| 4 | 8 | 3.9 ms |
+| 8 | 16 | 2.4 ms |
