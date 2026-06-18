@@ -20,6 +20,7 @@ import numpy as np
 
 try:
     import aadc
+    from backends import get_aadc_backend
     HAS_AADC = True
 except ImportError:
     HAS_AADC = False
@@ -143,30 +144,71 @@ def test_lotka_aadc_vs_fd():
         assert abs(ratio - 1.0) < 1e-6, f"grad[{i}] ratio: {ratio}"
 
 
-def test_3comp_casadi_crashes():
-    """3-compartment: CasADI crashes on conditional valve logic."""
+def test_3comp_casadi_raw_if_else_crashes():
+    """3-compartment: CasADI crashes ONLY when fed raw Python if/else.
+
+    This documents the failure mode the original repo's headline relied on: a
+    Python `if`/`<=` on a symbolic value calls __bool__ and raises. It is NOT a
+    fundamental CasADI limitation — see test_3comp_casadi_if_else_works.
+    """
     if not HAS_CASADI:
         Results.skipped += 1; print("  SKIP  (no casadi)"); return
 
+    x = ca.SX.sym('x')
     try:
-        import importlib
-        mod = importlib.import_module('3compartment')
-        u = importlib.import_module('3compartment_utilities')
-    except ImportError:
-        Results.skipped += 1; print("  SKIP  (circulatory_autogen model not found)"); return
-    try:
-
-        states = mod.create_states_array()
-        variables = mod.create_variables_array()
-        rates = np.zeros(u.STATE_COUNT)
-        mod.initialise_variables(states, rates, variables)
-        mod.compute_computed_constants(variables)
-
-        states[18] = ca.SX.sym('q_lv')
-        mod.compute_rates(0.0, states, rates, variables)
-        raise AssertionError("CasADI should have crashed but didn't")
+        # Raw Python branch on a symbol — the unfair setup.
+        _ = 1.0 if x <= 0.5 else 0.0
+        raise AssertionError("expected CasADI to refuse bool() of a symbol")
     except (RuntimeError, TypeError):
-        pass  # expected crash
+        pass  # expected
+
+
+def test_3comp_casadi_if_else_works():
+    """3-compartment: CasADI works once conditionals use ca.if_else (the fix)."""
+    if not HAS_CASADI:
+        Results.skipped += 1; print("  SKIP  (no casadi)"); return
+
+    from cvs3_casadi import build_casadi_kernel, evaluate
+    from cvs3_model import Params
+    p = Params()
+    fn, _ = build_casadi_kernel()
+    cost, grad = evaluate(fn, [p.q_lv_init, p.C_aortic, p.E_lv_A, p.E_lv_B])
+    assert math.isfinite(cost) and cost > 0, f"cost not positive/finite: {cost}"
+    assert all(math.isfinite(g) for g in grad), f"non-finite gradient: {grad}"
+
+
+def test_3comp_aadc_matches_casadi():
+    """3-compartment: AADC and CasADI gradients agree (same model+integrator)."""
+    if not HAS_AADC:
+        Results.skipped += 1; print("  SKIP  (no aadc)"); return
+    if not HAS_CASADI:
+        Results.skipped += 1; print("  SKIP  (no casadi)"); return
+
+    from cvs3_casadi import build_casadi_kernel, evaluate
+    from cvs3_model import Params, simulate
+    p = Params()
+    vals = [p.q_lv_init, p.C_aortic, p.E_lv_A, p.E_lv_B]
+
+    # CasADI
+    fn, _ = build_casadi_kernel()
+    _, grad_ca = evaluate(fn, vals)
+
+    # AADC
+    funcs = aadc.Functions()
+    funcs.start_recording()
+    ids = [aadc.idouble(v) for v in vals]
+    args = [i.mark_as_input() for i in ids]
+    cost = simulate(get_aadc_backend(), *ids)
+    r = cost.mark_as_output()
+    funcs.stop_recording()
+    res = aadc.evaluate(funcs, {r: list(args)},
+                        {a: v for a, v in zip(args, vals)}, aadc.ThreadPool(1))
+    grad_aa = [float(np.asarray(res[1][r][a]).flat[0]) for a in args]
+
+    for i, name in enumerate(['q_lv', 'C_ao', 'E_lv_A', 'E_lv_B']):
+        denom = max(abs(grad_aa[i]), abs(grad_ca[i]), 1e-300)
+        rel = abs(grad_aa[i] - grad_ca[i]) / denom
+        assert rel < 1e-6, f"d/d{name}: AADC vs CasADI rel diff = {rel:.2e}"
 
 
 def test_3comp_aadc_works():
@@ -541,7 +583,9 @@ def main():
     tests = [
         ("Lotka-Volterra: AADC vs CasADI", test_lotka_aadc_vs_casadi),
         ("Lotka-Volterra: AADC vs FD", test_lotka_aadc_vs_fd),
-        ("3-compartment: CasADI crashes", test_3comp_casadi_crashes),
+        ("3-compartment: raw if/else crashes CasADI", test_3comp_casadi_raw_if_else_crashes),
+        ("3-compartment: CasADI works via ca.if_else", test_3comp_casadi_if_else_works),
+        ("3-compartment: AADC matches CasADI", test_3comp_aadc_matches_casadi),
         ("3-compartment: AADC works", test_3comp_aadc_works),
         ("3-compartment: AADC gradient vs FD", test_3comp_aadc_gradient_vs_fd),
         ("3-compartment: Hessian symmetric", test_3comp_hessian_symmetric),
