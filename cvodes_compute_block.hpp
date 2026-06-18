@@ -179,6 +179,7 @@ private:
     struct CvodesUserData {
         const CvodesRhsFunc* rhs;
         const CvodesJacFunc* jac;
+        const CvodesParJacFunc* par_jac;
         const double* params;
         int n_s, n_p;
     };
@@ -203,7 +204,7 @@ private:
         N_Vector y = N_VNew_Serial(n_states, ctx);
         memcpy(N_VGetArrayPointer(y), x0.data(), n_states * sizeof(double));
 
-        CvodesUserData udata = {&rhs, &jac, params, n_states, n_params};
+        CvodesUserData udata = {&rhs, &jac, &par_jac, params, n_states, n_params};
 
         void* cvode = CVodeCreate(CV_BDF, ctx);
         CVodeInit(cvode, cvodes_rhs_wrapper, 0.0, y);
@@ -226,48 +227,122 @@ private:
         CVodeFree(&cvode); SUNContext_Free(&ctx);
     }
 
-    void run_cvodes_adjoint(const double* params, const double* lambda_T, double* dJdp) const {
-        // Simple adjoint via sensitivity: integrate backward
-        // dλ/dt = -(df/dx)^T λ,  dμ/dt = -(df/dp)^T λ
-        // Using backward Euler for simplicity (can upgrade to CVODES adjoint)
+    // Backward RHS for CVODES adjoint: dλ/dt = -(df/dx)^T λ
+    static int cvodes_rhsB_wrapper(realtype t, N_Vector y, N_Vector yB,
+                                    N_Vector yBdot, void* udata) {
+        auto* ud = (CvodesUserData*)udata;
+        int n = ud->n_s;
+        const double* x = N_VGetArrayPointer(y);    // forward state (reconstructed)
+        const double* lam = N_VGetArrayPointer(yB);  // adjoint state
+        double* lamdot = N_VGetArrayPointer(yBdot);
 
-        int n = n_states, m = n_params;
-        double dt = max_step;
-        int steps = (int)(T_final / dt);
+        // Compute Jacobian df/dx
+        std::vector<double> Jx(n * n);
+        (*ud->jac)(t, x, Jx.data(), ud->params, n, ud->n_p);
 
-        std::vector<double> lam(lambda_T, lambda_T + n);
-        memset(dJdp, 0, m * sizeof(double));
-
-        std::vector<double> Jx(n * n);   // df/dx
-        std::vector<double> Jp(n * m);   // df/dp
-
-        // Walk backward from T to 0
-        for (int step = steps; step >= 0; step--) {
-            double t = step * dt;
-
-            // Use stored final state (approximate — should recompute from checkpoints)
-            // For now use x_final as constant (accurate for steady-state models)
-            jac(t, x_final_stored.data(), Jx.data(), params, n, m);
-            if (par_jac)
-                par_jac(t, x_final_stored.data(), Jp.data(), params, n, m);
-
-            // dλ/dt = -(df/dx)^T λ → λ -= dt * (df/dx)^T λ
-            std::vector<double> Jtl(n, 0);
-            for (int i = 0; i < n; i++)
-                for (int j = 0; j < n; j++)
-                    Jtl[i] += Jx[j * n + i] * lam[j];  // J^T * lambda
-            for (int i = 0; i < n; i++)
-                lam[i] -= dt * Jtl[i];
-
-            // dμ/dt = -(df/dp)^T λ → μ += dt * (df/dp)^T λ
-            if (par_jac) {
-                for (int j = 0; j < m; j++) {
-                    double acc = 0;
-                    for (int i = 0; i < n; i++)
-                        acc += Jp[i * m + j] * lam[i];
-                    dJdp[j] += dt * acc;
-                }
-            }
+        // lamdot = -(df/dx)^T * lambda
+        for (int i = 0; i < n; i++) {
+            lamdot[i] = 0;
+            for (int j = 0; j < n; j++)
+                lamdot[i] -= Jx[j * n + i] * lam[j];  // -J^T * lambda
         }
+        return 0;
+    }
+
+    // Backward quadrature RHS: dμ/dt = -(df/dp)^T λ
+    static int cvodes_qrhsB_wrapper(realtype t, N_Vector y, N_Vector yB,
+                                     N_Vector qBdot, void* udata) {
+        auto* ud = (CvodesUserData*)udata;
+        int n = ud->n_s, m = ud->n_p;
+        const double* x = N_VGetArrayPointer(y);
+        const double* lam = N_VGetArrayPointer(yB);
+        double* mudot = N_VGetArrayPointer(qBdot);
+
+        // Compute df/dp
+        std::vector<double> Jp(n * m, 0);
+        if (ud->par_jac)
+            (*ud->par_jac)(t, x, Jp.data(), ud->params, n, m);
+
+        // mudot = -(df/dp)^T * lambda
+        for (int j = 0; j < m; j++) {
+            mudot[j] = 0;
+            for (int i = 0; i < n; i++)
+                mudot[j] -= Jp[i * m + j] * lam[i];
+        }
+        return 0;
+    }
+
+    void run_cvodes_adjoint(const double* params, const double* lambda_T, double* dJdp) const {
+        // Full CVODES adjoint: CVodeF (forward with checkpoints) + CVodeB (backward)
+        int n = n_states, m = n_params;
+
+        SUNContext ctx;
+        SUNContext_Create(NULL, &ctx);
+
+        N_Vector y = N_VNew_Serial(n, ctx);
+        memcpy(N_VGetArrayPointer(y), x0.data(), n * sizeof(double));
+
+        CvodesUserData udata = {&rhs, &jac, &par_jac, params, n, m};
+
+        void* cvode = CVodeCreate(CV_BDF, ctx);
+        CVodeInit(cvode, cvodes_rhs_wrapper, 0.0, y);
+        CVodeSStolerances(cvode, rtol, atol);
+        CVodeSetMaxNumSteps(cvode, 500000);
+        CVodeSetMaxStep(cvode, max_step);
+        CVodeSetUserData(cvode, &udata);
+
+        SUNMatrix A = SUNDenseMatrix(n, n, ctx);
+        SUNLinearSolver LS = SUNLinSol_Dense(y, A, ctx);
+        CVodeSetLinearSolver(cvode, LS, A);
+        CVodeSetJacFn(cvode, cvodes_jac_wrapper);
+
+        // Initialize adjoint computation with checkpointing
+        int ncheck;
+        CVodeAdjInit(cvode, 150, CV_HERMITE);  // 150 steps between checkpoints
+
+        // Forward integration with checkpoint storage
+        realtype t_out;
+        CVodeF(cvode, T_final, y, &t_out, CV_NORMAL, &ncheck);
+
+        // Create backward problem
+        int indexB;
+        CVodeCreateB(cvode, CV_BDF, &indexB);
+
+        // Initial condition for adjoint: λ(T) = lambda_T
+        N_Vector yB = N_VNew_Serial(n, ctx);
+        memcpy(N_VGetArrayPointer(yB), lambda_T, n * sizeof(double));
+        CVodeInitB(cvode, indexB, cvodes_rhsB_wrapper, T_final, yB);
+        CVodeSStolerancesB(cvode, indexB, rtol, atol);
+
+        SUNMatrix AB = SUNDenseMatrix(n, n, ctx);
+        SUNLinearSolver LSB = SUNLinSol_Dense(yB, AB, ctx);
+        CVodeSetLinearSolverB(cvode, indexB, LSB, AB);
+
+        CVodeSetUserDataB(cvode, indexB, &udata);
+
+        // Quadrature for parameter sensitivity: μ(T)=0, dμ/dt = -(df/dp)^T λ
+        N_Vector qB = N_VNew_Serial(m, ctx);
+        N_VConst(0.0, qB);
+        CVodeQuadInitB(cvode, indexB, cvodes_qrhsB_wrapper, qB);
+        CVodeQuadSStolerancesB(cvode, indexB, rtol, atol);
+        CVodeSetQuadErrConB(cvode, indexB, SUNTRUE);
+
+        // Backward integration
+        CVodeB(cvode, 0.0, CV_NORMAL);
+
+        // Get results
+        CVodeGetB(cvode, indexB, &t_out, yB);
+        CVodeGetQuadB(cvode, indexB, &t_out, qB);
+
+        // dJ/dp = -μ(0) (sign convention)
+        double* mu = N_VGetArrayPointer(qB);
+        for (int j = 0; j < m; j++)
+            dJdp[j] = -mu[j];
+
+        // Cleanup
+        N_VDestroy(y); N_VDestroy(yB); N_VDestroy(qB);
+        SUNMatDestroy(A); SUNMatDestroy(AB);
+        SUNLinSolFree(LS); SUNLinSolFree(LSB);
+        CVodeFree(&cvode); SUNContext_Free(&ctx);
     }
 };
