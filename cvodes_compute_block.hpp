@@ -198,58 +198,57 @@ private:
     }
 
     void run_cvodes_forward(const double* params, double* x_final) const {
+        // Simple forward-only (no adjoint)
         SUNContext ctx;
         SUNContext_Create(NULL, &ctx);
-
         N_Vector y = N_VNew_Serial(n_states, ctx);
         memcpy(N_VGetArrayPointer(y), x0.data(), n_states * sizeof(double));
-
         CvodesUserData udata = {&rhs, &jac, &par_jac, params, n_states, n_params};
-
         void* cvode = CVodeCreate(CV_BDF, ctx);
         CVodeInit(cvode, cvodes_rhs_wrapper, 0.0, y);
         CVodeSStolerances(cvode, rtol, atol);
         CVodeSetMaxNumSteps(cvode, 500000);
         CVodeSetMaxStep(cvode, max_step);
         CVodeSetUserData(cvode, &udata);
-
         SUNMatrix A = SUNDenseMatrix(n_states, n_states, ctx);
         SUNLinearSolver LS = SUNLinSol_Dense(y, A, ctx);
         CVodeSetLinearSolver(cvode, LS, A);
         CVodeSetJacFn(cvode, cvodes_jac_wrapper);
-
         realtype t_out;
         CVode(cvode, T_final, y, &t_out, CV_NORMAL);
-
         memcpy(x_final, N_VGetArrayPointer(y), n_states * sizeof(double));
-
         N_VDestroy(y); SUNMatDestroy(A); SUNLinSolFree(LS);
         CVodeFree(&cvode); SUNContext_Free(&ctx);
     }
 
-    // Backward RHS for CVODES adjoint: dλ/dt = -(df/dx)^T λ
+    // Backward RHS for CVODES adjoint: yBdot_i = -sum_j (df_j/dx_i) * yB_j
+    // Uses the user-supplied jac function for df/dx, but the indexing must
+    // match: jac fills J in SUNDIALS column-major order J[col*n+row] = df_row/dx_col
     static int cvodes_rhsB_wrapper(realtype t, N_Vector y, N_Vector yB,
                                     N_Vector yBdot, void* udata) {
         auto* ud = (CvodesUserData*)udata;
         int n = ud->n_s;
-        const double* x = N_VGetArrayPointer(y);    // forward state (reconstructed)
-        const double* lam = N_VGetArrayPointer(yB);  // adjoint state
+        const double* x = N_VGetArrayPointer(y);
+        const double* lam = N_VGetArrayPointer(yB);
         double* lamdot = N_VGetArrayPointer(yBdot);
 
-        // Compute Jacobian df/dx
+        // Compute full Jacobian df/dx (column-major)
         std::vector<double> Jx(n * n);
         (*ud->jac)(t, x, Jx.data(), ud->params, n, ud->n_p);
 
-        // lamdot = -(df/dx)^T * lambda
+        // lamdot_i = -sum_j df_j/dx_i * lambda_j
+        // In column-major: df_j/dx_i = Jx[i*n + j] (i=column index for df_j/dx_i)
+        // Wait: SUNDIALS stores J[col*n + row] = df_row/dx_col
+        // So df_j/dx_i means row=j, col=i → Jx[i*n + j]
         for (int i = 0; i < n; i++) {
             lamdot[i] = 0;
             for (int j = 0; j < n; j++)
-                lamdot[i] -= Jx[j * n + i] * lam[j];  // -J^T * lambda
+                lamdot[i] -= Jx[i * n + j] * lam[j];
         }
         return 0;
     }
 
-    // Backward quadrature RHS: dμ/dt = -(df/dp)^T λ
+    // Backward quadrature: qBdot_j = -sum_i (df_i/dp_j) * yB_i
     static int cvodes_qrhsB_wrapper(realtype t, N_Vector y, N_Vector yB,
                                      N_Vector qBdot, void* udata) {
         auto* ud = (CvodesUserData*)udata;
@@ -258,12 +257,12 @@ private:
         const double* lam = N_VGetArrayPointer(yB);
         double* mudot = N_VGetArrayPointer(qBdot);
 
-        // Compute df/dp
         std::vector<double> Jp(n * m, 0);
         if (ud->par_jac)
             (*ud->par_jac)(t, x, Jp.data(), ud->params, n, m);
 
-        // mudot = -(df/dp)^T * lambda
+        // mudot_j = -sum_i df_i/dp_j * lambda_i
+        // Jp[i*m+j] = df_i/dp_j (row-major as user supplies)
         for (int j = 0; j < m; j++) {
             mudot[j] = 0;
             for (int i = 0; i < n; i++)
@@ -273,7 +272,7 @@ private:
     }
 
     void run_cvodes_adjoint(const double* params, const double* lambda_T, double* dJdp) const {
-        // Full CVODES adjoint: CVodeF (forward with checkpoints) + CVodeB (backward)
+        // Full CVODES adjoint: CVodeF + CVodeB on SAME instance (shared checkpoints)
         int n = n_states, m = n_params;
 
         SUNContext ctx;
@@ -286,60 +285,52 @@ private:
 
         void* cvode = CVodeCreate(CV_BDF, ctx);
         CVodeInit(cvode, cvodes_rhs_wrapper, 0.0, y);
-        CVodeSStolerances(cvode, rtol, atol);
+        CVodeSStolerances(cvode, 1e-10, 1e-12);
         CVodeSetMaxNumSteps(cvode, 500000);
-        CVodeSetMaxStep(cvode, max_step);
         CVodeSetUserData(cvode, &udata);
 
         SUNMatrix A = SUNDenseMatrix(n, n, ctx);
         SUNLinearSolver LS = SUNLinSol_Dense(y, A, ctx);
         CVodeSetLinearSolver(cvode, LS, A);
-        CVodeSetJacFn(cvode, cvodes_jac_wrapper);
 
-        // Initialize adjoint computation with checkpointing
+        // Step 1: Initialize adjoint module (allocates checkpoint storage)
         int ncheck;
-        CVodeAdjInit(cvode, 150, CV_HERMITE);  // 150 steps between checkpoints
+        CVodeAdjInit(cvode, 150, CV_HERMITE);
 
-        // Forward integration with checkpoint storage
+        // Step 2: Forward integration with CVodeF (stores checkpoints)
         realtype t_out;
         CVodeF(cvode, T_final, y, &t_out, CV_NORMAL, &ncheck);
 
-        // Create backward problem
+        // Step 3: Create backward problem on SAME cvode instance
         int indexB;
         CVodeCreateB(cvode, CV_BDF, &indexB);
 
-        // Initial condition for adjoint: λ(T) = lambda_T
         N_Vector yB = N_VNew_Serial(n, ctx);
         memcpy(N_VGetArrayPointer(yB), lambda_T, n * sizeof(double));
         CVodeInitB(cvode, indexB, cvodes_rhsB_wrapper, T_final, yB);
-        CVodeSStolerancesB(cvode, indexB, rtol, atol);
+        CVodeSStolerancesB(cvode, indexB, 1e-10, 1e-12);
 
         SUNMatrix AB = SUNDenseMatrix(n, n, ctx);
         SUNLinearSolver LSB = SUNLinSol_Dense(yB, AB, ctx);
         CVodeSetLinearSolverB(cvode, indexB, LSB, AB);
-
         CVodeSetUserDataB(cvode, indexB, &udata);
 
-        // Quadrature for parameter sensitivity: μ(T)=0, dμ/dt = -(df/dp)^T λ
+        // Step 4: Quadrature for dJ/dp
         N_Vector qB = N_VNew_Serial(m, ctx);
         N_VConst(0.0, qB);
         CVodeQuadInitB(cvode, indexB, cvodes_qrhsB_wrapper, qB);
-        CVodeQuadSStolerancesB(cvode, indexB, rtol, atol);
+        CVodeQuadSStolerancesB(cvode, indexB, 1e-10, 1e-12);
         CVodeSetQuadErrConB(cvode, indexB, SUNTRUE);
 
-        // Backward integration
+        // Step 5: Backward integration (reconstructs forward from checkpoints)
         CVodeB(cvode, 0.0, CV_NORMAL);
 
-        // Get results
-        CVodeGetB(cvode, indexB, &t_out, yB);
+        // Step 6: Extract dJ/dp
         CVodeGetQuadB(cvode, indexB, &t_out, qB);
-
-        // dJ/dp = -μ(0) (sign convention)
         double* mu = N_VGetArrayPointer(qB);
         for (int j = 0; j < m; j++)
-            dJdp[j] = -mu[j];
+            dJdp[j] = mu[j];
 
-        // Cleanup
         N_VDestroy(y); N_VDestroy(yB); N_VDestroy(qB);
         SUNMatDestroy(A); SUNMatDestroy(AB);
         SUNLinSolFree(LS); SUNLinSolFree(LSB);
