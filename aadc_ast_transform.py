@@ -206,47 +206,37 @@ class _AadcCompatTransformer(ast.NodeTransformer):
                 keywords=[],
             )
 
-        # --- fabs(x) → aadc.iif(x >= 0, x, -x) ---
+        # --- fabs(x) → aadc.math.abs(x) ---
         if (isinstance(node.func, ast.Name) and
             node.func.id == 'fabs' and
             len(node.args) == 1):
-            x = node.args[0]
-            return ast.Call(
-                func=ast.Attribute(
+            node.func = ast.Attribute(
+                value=ast.Attribute(
                     value=ast.Name(id='aadc', ctx=ast.Load()),
-                    attr='iif',
+                    attr='math',
                     ctx=ast.Load(),
                 ),
-                args=[
-                    ast.Compare(left=copy.deepcopy(x), ops=[ast.GtE()],
-                                comparators=[ast.Constant(value=0.0)]),
-                    x,
-                    ast.UnaryOp(op=ast.USub(), operand=copy.deepcopy(x)),
-                ],
-                keywords=[],
+                attr='abs',
+                ctx=ast.Load(),
             )
+            return node
 
-        # --- math.fabs(x) → same as fabs ---
+        # --- math.fabs(x) → aadc.math.abs(x) ---
         if (isinstance(node.func, ast.Attribute) and
             isinstance(node.func.value, ast.Name) and
             node.func.value.id == 'math' and
             node.func.attr == 'fabs' and
             len(node.args) == 1):
-            x = node.args[0]
-            return ast.Call(
-                func=ast.Attribute(
+            node.func = ast.Attribute(
+                value=ast.Attribute(
                     value=ast.Name(id='aadc', ctx=ast.Load()),
-                    attr='iif',
+                    attr='math',
                     ctx=ast.Load(),
                 ),
-                args=[
-                    ast.Compare(left=copy.deepcopy(x), ops=[ast.GtE()],
-                                comparators=[ast.Constant(value=0.0)]),
-                    x,
-                    ast.UnaryOp(op=ast.USub(), operand=copy.deepcopy(x)),
-                ],
-                keywords=[],
+                attr='abs',
+                ctx=ast.Load(),
             )
+            return node
 
         return node
 
