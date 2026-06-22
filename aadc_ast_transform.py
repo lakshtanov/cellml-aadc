@@ -178,6 +178,76 @@ class _AadcCompatTransformer(ast.NodeTransformer):
                 comparators=[node.args[1]],
             )
 
+        # --- and_func(a, b) → aadc.iand(a, b) ---
+        if (isinstance(node.func, ast.Name) and
+            node.func.id == 'and_func' and
+            len(node.args) == 2):
+            return ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id='aadc', ctx=ast.Load()),
+                    attr='iand',
+                    ctx=ast.Load(),
+                ),
+                args=node.args,
+                keywords=[],
+            )
+
+        # --- or_func(a, b) → aadc.ior(a, b) ---
+        if (isinstance(node.func, ast.Name) and
+            node.func.id == 'or_func' and
+            len(node.args) == 2):
+            return ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id='aadc', ctx=ast.Load()),
+                    attr='ior',
+                    ctx=ast.Load(),
+                ),
+                args=node.args,
+                keywords=[],
+            )
+
+        # --- fabs(x) → aadc.iif(x >= 0, x, -x) ---
+        if (isinstance(node.func, ast.Name) and
+            node.func.id == 'fabs' and
+            len(node.args) == 1):
+            x = node.args[0]
+            return ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id='aadc', ctx=ast.Load()),
+                    attr='iif',
+                    ctx=ast.Load(),
+                ),
+                args=[
+                    ast.Compare(left=copy.deepcopy(x), ops=[ast.GtE()],
+                                comparators=[ast.Constant(value=0.0)]),
+                    x,
+                    ast.UnaryOp(op=ast.USub(), operand=copy.deepcopy(x)),
+                ],
+                keywords=[],
+            )
+
+        # --- math.fabs(x) → same as fabs ---
+        if (isinstance(node.func, ast.Attribute) and
+            isinstance(node.func.value, ast.Name) and
+            node.func.value.id == 'math' and
+            node.func.attr == 'fabs' and
+            len(node.args) == 1):
+            x = node.args[0]
+            return ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id='aadc', ctx=ast.Load()),
+                    attr='iif',
+                    ctx=ast.Load(),
+                ),
+                args=[
+                    ast.Compare(left=copy.deepcopy(x), ops=[ast.GtE()],
+                                comparators=[ast.Constant(value=0.0)]),
+                    x,
+                    ast.UnaryOp(op=ast.USub(), operand=copy.deepcopy(x)),
+                ],
+                keywords=[],
+            )
+
         return node
 
 
