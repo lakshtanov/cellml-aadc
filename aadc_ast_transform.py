@@ -86,7 +86,8 @@ class _AadcCompatTransformer(ast.NodeTransformer):
             )
             return node
 
-        # --- bare floor(x) → math.floor(float(x)) ---
+        # --- bare floor(x) → math.floor(_aadc_passive(x)) ---
+        # _aadc_passive extracts passive value via .val() for idouble
         if (isinstance(node.func, ast.Name) and
             node.func.id == 'floor'):
             node.func = ast.Attribute(
@@ -95,22 +96,22 @@ class _AadcCompatTransformer(ast.NodeTransformer):
                 ctx=ast.Load(),
             )
             node.args = [ast.Call(
-                func=ast.Name(id='float', ctx=ast.Load()),
+                func=ast.Name(id='_aadc_passive', ctx=ast.Load()),
                 args=node.args,
                 keywords=[],
             )]
             return node
 
-        # --- math.floor(x) → math.floor(float(x)) ---
+        # --- math.floor(x) → math.floor(_aadc_passive(x)) ---
         # floor is used for heart timing (S_HEART, CHI_A, CHI_V).
         # These don't depend on calibration parameters, so using
-        # the passive (float) value is correct and avoids tape issues.
+        # the passive value is correct and avoids tape issues.
         if (isinstance(node.func, ast.Attribute) and
             isinstance(node.func.value, ast.Name) and
             node.func.value.id == 'math' and
             node.func.attr == 'floor'):
             node.args = [ast.Call(
-                func=ast.Name(id='float', ctx=ast.Load()),
+                func=ast.Name(id='_aadc_passive', ctx=ast.Load()),
                 args=node.args,
                 keywords=[],
             )]
@@ -210,6 +211,17 @@ class _AadcCompatTransformer(ast.NodeTransformer):
                 comparators=[node.args[1]],
             )
 
+        # --- pow(x, 2.0) → x * x (avoid float conversion) ---
+        if (isinstance(node.func, ast.Name) and
+            node.func.id == 'pow' and
+            len(node.args) == 2):
+            exp = node.args[1]
+            if isinstance(exp, ast.Constant) and exp.value == 2.0:
+                x = node.args[0]
+                return ast.BinOp(left=x, op=ast.Mult(), right=copy.deepcopy(x))
+            # General pow: x ** n
+            return ast.BinOp(left=node.args[0], op=ast.Pow(), right=node.args[1])
+
         # --- and_func(a, b) → aadc.iand(a, b) ---
         if (isinstance(node.func, ast.Name) and
             node.func.id == 'and_func' and
@@ -288,9 +300,12 @@ def transform_to_aadc(source_code: str) -> str:
 
     result = ast.unparse(transformed)
 
-    # Add aadc import if not present
+    # Add aadc import and _aadc_passive helper
+    header = "import aadc\ndef _aadc_passive(x):\n    return x.val() if hasattr(x, 'val') else float(x)\n"
     if 'import aadc' not in result:
-        result = 'import aadc\n' + result
+        result = header + result
+    elif '_aadc_passive' not in result:
+        result = result.replace('import aadc', header.rstrip())
 
     return result
 
