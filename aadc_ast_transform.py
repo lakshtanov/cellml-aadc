@@ -36,6 +36,9 @@ class _AadcCompatTransformer(ast.NodeTransformer):
     AADC_MATH_FUNCS = {'cos', 'sin', 'tan', 'exp', 'log', 'sqrt',
                        'acos', 'asin', 'atan', 'cosh', 'sinh', 'tanh'}
 
+    # bare functions from "from math import *" that need conversion
+    BARE_MATH_FUNCS = AADC_MATH_FUNCS  # same set
+
     def visit_IfExp(self, node):
         """x if cond else y  →  aadc.iif(cond, x, y)"""
         self.generic_visit(node)
@@ -67,6 +70,35 @@ class _AadcCompatTransformer(ast.NodeTransformer):
                 attr=node.func.attr,
                 ctx=ast.Load(),
             )
+            return node
+
+        # --- bare cos(x), sin(x) etc. (from "from math import *") → aadc.math.cos(x) ---
+        if (isinstance(node.func, ast.Name) and
+            node.func.id in self.BARE_MATH_FUNCS):
+            node.func = ast.Attribute(
+                value=ast.Attribute(
+                    value=ast.Name(id='aadc', ctx=ast.Load()),
+                    attr='math',
+                    ctx=ast.Load(),
+                ),
+                attr=node.func.id,
+                ctx=ast.Load(),
+            )
+            return node
+
+        # --- bare floor(x) → math.floor(float(x)) ---
+        if (isinstance(node.func, ast.Name) and
+            node.func.id == 'floor'):
+            node.func = ast.Attribute(
+                value=ast.Name(id='math', ctx=ast.Load()),
+                attr='floor',
+                ctx=ast.Load(),
+            )
+            node.args = [ast.Call(
+                func=ast.Name(id='float', ctx=ast.Load()),
+                args=node.args,
+                keywords=[],
+            )]
             return node
 
         # --- math.floor(x) → math.floor(float(x)) ---
