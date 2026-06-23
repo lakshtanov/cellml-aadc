@@ -39,6 +39,29 @@ class _AadcCompatTransformer(ast.NodeTransformer):
     # bare functions from "from math import *" that need conversion
     BARE_MATH_FUNCS = AADC_MATH_FUNCS  # same set
 
+    def visit_BoolOp(self, node):
+        """a and b and c → aadc.iand(a, aadc.iand(b, c))"""
+        self.generic_visit(node)
+        if isinstance(node.op, ast.And):
+            result = node.values[-1]
+            for val in reversed(node.values[:-1]):
+                result = ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id='aadc', ctx=ast.Load()),
+                        attr='iand', ctx=ast.Load()),
+                    args=[val, result], keywords=[])
+            return result
+        if isinstance(node.op, ast.Or):
+            result = node.values[-1]
+            for val in reversed(node.values[:-1]):
+                result = ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id='aadc', ctx=ast.Load()),
+                        attr='ior', ctx=ast.Load()),
+                    args=[val, result], keywords=[])
+            return result
+        return node
+
     def visit_IfExp(self, node):
         """x if cond else y  →  aadc.iif(cond, x, y)"""
         self.generic_visit(node)
